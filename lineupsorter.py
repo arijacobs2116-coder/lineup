@@ -199,7 +199,7 @@ def stat_rank_table(df_lineups: pd.DataFrame, title: str, metric_map: Dict[str, 
     with c3:
         min_poss = st.number_input(f"Minimum {poss_col}", min_value=0.0, value=25.0, step=1.0, key=f"{title}_minposs")
     with c4:
-        topn = st.number_input("Show Top", min_value=5, value=500, step=10, key=f"{title}_topn")
+        topn = st.number_input("Show top N", min_value=10, value=50, step=10, key=f"{title}_topn")
 
     col = metric_map[metric_label]
 
@@ -316,7 +316,7 @@ if not data_path or not Path(data_path).exists():
 # Controls
 st.sidebar.header("Settings")
 lineup_size = st.sidebar.slider("Lineup size", 1, 5, 5, 1)
-min_total_poss = st.sidebar.number_input("Minimum total possessions (OffPoss+DefPoss)", min_value=0, value=50, step=1)
+min_total_poss = st.sidebar.number_input("Minimum total possessions (OffPoss+DefPoss)", min_value=0.0, value=50.0, step=1.0)
 per100_toggle = st.sidebar.toggle("Show rates per 100 possessions", value=True)
 show_raw_columns = st.sidebar.toggle("Show raw sum columns", value=False)
 
@@ -337,10 +337,14 @@ agg = apply_per100(agg, per100_toggle)
 agg = round_1_decimal(agg)
 
 # Tabs
-tabs = st.tabs(["Dashboard", "Offense", "Defense"])
+tabs = st.tabs(["Dashboard", "Comparison", "Offense", "Defense"])
 
 with tabs[0]:
     st.subheader(f"Dashboard — {lineup_size}-Man Lineups")
+    st.caption(
+        "Metrics: ORTG=100*PtsFor/OffPoss, DRTG=100*PtsAg/DefPoss, NRTG=ORTG-DRTG, "
+        "TovR=TOVfor/OffPoss, RimR=RimAttFor/OffPoss, 3PR=ThreePA_For/OffPoss."
+    )
 
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
@@ -348,7 +352,7 @@ with tabs[0]:
     with c2:
         asc = st.toggle("Ascending", value=False)
     with c3:
-        topn = st.number_input("Show Top", min_value=5, value=25, step=5)
+        topn = st.number_input("Show top N", min_value=10, value=50, step=10)
 
     base_cols = ["Lineup", "TotalPoss", "OffPoss", "DefPoss", "ORTG", "DRTG", "NRTG", "TovR", "RimR", "3PR"]
     view = agg.sort_values(sort_metric, ascending=bool(asc)).head(int(topn))
@@ -356,7 +360,76 @@ with tabs[0]:
         view = view[base_cols]
     st.dataframe(view, use_container_width=True, hide_index=True)
 
+
 with tabs[1]:
+    st.subheader("Comparison")
+    st.caption(
+        "Pick any metrics below. Each lineup gets a rank for every selected metric, "
+        "then we average those ranks. **Lower average rank = better overall**."
+    )
+
+    # Define which direction is "better" for each metric
+    # True  -> higher is better
+    # False -> lower is better
+    metric_defs = {
+        "ORTG (higher better)": ("ORTG", True),
+        "DRTG (lower better)": ("DRTG", False),
+        "NRTG (higher better)": ("NRTG", True),
+        "TovR (lower better)": ("TovR", False),
+        "RimR (higher better)": ("RimR", True),
+        "3PR (higher better)": ("3PR", True),
+    }
+
+    st.markdown("#### Choose metrics")
+    # "Clickable boxes" -> checkboxes arranged in a row
+    # (Streamlit checkboxes are the most reliable clickable UI element for this.)
+    cols = st.columns(6)
+    selected_keys = []
+    for i, label in enumerate(metric_defs.keys()):
+        with cols[i % 6]:
+            if st.checkbox(label, value=(label in st.session_state.get("cmp_selected", [])), key=f"cmp_{i}"):
+                selected_keys.append(label)
+
+    st.session_state["cmp_selected"] = selected_keys
+
+    if len(selected_keys) == 0:
+        st.info("Select at least 1 metric to generate comparison rankings.")
+    else:
+        # Build rank table
+        tmp = agg.copy()
+
+        rank_cols = []
+        for label in selected_keys:
+            col, higher_better = metric_defs[label]
+            # Rank: 1 = best
+            tmp[f"Rank_{col}"] = tmp[col].rank(
+                ascending=not higher_better,
+                method="average"
+            )
+            rank_cols.append(f"Rank_{col}")
+
+        tmp["AvgRank"] = tmp[rank_cols].mean(axis=1)
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            topn = st.number_input("Show top N", min_value=10, value=50, step=10, key="cmp_topn")
+        with c2:
+            show_rank_cols = st.toggle("Show component ranks", value=True, key="cmp_show_ranks")
+
+        show_cols = ["Lineup", "TotalPoss", "OffPoss", "DefPoss"]
+        # Add selected metrics
+        for label in selected_keys:
+            col, _ = metric_defs[label]
+            show_cols.append(col)
+        if show_rank_cols:
+            show_cols += rank_cols
+        show_cols += ["AvgRank"]
+
+        out = tmp.sort_values("AvgRank", ascending=True).head(int(topn))
+        st.dataframe(round_1_decimal(out[show_cols]), use_container_width=True, hide_index=True)
+
+
+with tabs[3]:
     metric_map = {
         "Pts For": "PtsFor",
         "TOV": "TOV",
