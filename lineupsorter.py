@@ -23,22 +23,24 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ###############################################################################
-# Auth helpers (SQLite + bcrypt)
+# Auth helpers (SQLite + bcrypt) — Email-based accounts
 ###############################################################################
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            pw_hash  BLOB NOT NULL
+            email   TEXT PRIMARY KEY,
+            pw_hash BLOB NOT NULL
         );
         """
     )
     return conn
 
-def _valid_username(u: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9_]{3,24}", u or ""))
+def _valid_email(email: str) -> bool:
+    return bool(EMAIL_RE.fullmatch((email or "").strip().lower()))
 
 def _hash_pw(password: str) -> bytes:
     salt = bcrypt.gensalt(rounds=12)
@@ -50,51 +52,54 @@ def _check_pw(password: str, pw_hash: bytes) -> bool:
     except Exception:
         return False
 
-def create_user(username: str, password: str) -> Tuple[bool, str]:
-    if not _valid_username(username):
-        return False, "Username must be 3–24 characters: letters, numbers, underscore."
+def create_user(email: str, password: str) -> Tuple[bool, str]:
+    email = (email or "").strip().lower()
+    if not _valid_email(email):
+        return False, "Enter a valid email address."
     if password is None or len(password) < 8:
         return False, "Password must be at least 8 characters."
 
     conn = _get_conn()
     try:
-        cur = conn.execute("SELECT username FROM users WHERE username = ?", (username,))
+        cur = conn.execute("SELECT email FROM users WHERE email = ?", (email,))
         if cur.fetchone() is not None:
-            return False, "That username already exists."
+            return False, "That email already exists."
 
         conn.execute(
-            "INSERT INTO users(username, pw_hash) VALUES(?, ?)",
-            (username, _hash_pw(password)),
+            "INSERT INTO users(email, pw_hash) VALUES(?, ?)",
+            (email, _hash_pw(password)),
         )
         conn.commit()
-        return True, "Account created. You can log in now."
+        return True, "Account created."
     finally:
         conn.close()
 
-def authenticate(username: str, password: str) -> Tuple[bool, str]:
+def authenticate(email: str, password: str) -> Tuple[bool, str]:
+    email = (email or "").strip().lower()
     conn = _get_conn()
     try:
-        cur = conn.execute("SELECT pw_hash FROM users WHERE username = ?", (username,))
+        cur = conn.execute("SELECT pw_hash FROM users WHERE email = ?", (email,))
         row = cur.fetchone()
         if row is None:
-            return False, "Invalid username or password."
+            return False, "Invalid email or password."
         pw_hash = row[0]
-        if isinstance(pw_hash, memoryview):  # sqlite can return memoryview
+        if isinstance(pw_hash, memoryview):
             pw_hash = pw_hash.tobytes()
         ok = _check_pw(password, pw_hash)
-        return (ok, "Logged in." if ok else "Invalid username or password.")
+        return (ok, "Logged in." if ok else "Invalid email or password.")
     finally:
         conn.close()
 
-def user_upload_path(username: str) -> Path:
-    safe = username
+def user_upload_path(email: str) -> Path:
+    # simple filesystem-safe name
+    safe = re.sub(r"[^a-z0-9_.-]+", "_", (email or "").strip().lower())
     return UPLOAD_DIR / f"{safe}.xlsx"
 
 ###############################################################################
 # Data logic
 ###############################################################################
 REQUIRED_COLUMNS = [
-    "Side", "P1", "P2", "P3", "P4", "P5",
+    "P1", "P2", "P3", "P4", "P5",
     "PtsFor", "PtsAg",
     "TOV", "TOV Forced",
     "OReb", "OReb Ag",
@@ -107,43 +112,16 @@ REQUIRED_COLUMNS = [
     "OffPoss", "DefPoss",
 ]
 
-OFFENSE_COLS = {
-    "Pts For": "PtsFor",
-    "TOV": "TOV",
-    "OReb": "OReb",
-    "OppDefReb": "OppDefReb",
-    "FTA For": "FTA For",
-    "Rim Att": "RimAtt",
-    "3PA": "ThreePA",
-    "Non-Paint 3": "NonPaint3",
-    "Action 3": "Action3",
-    "Transition 3": "Transition3",
-    "Paint 3": "Paint3",
-}
-
-DEFENSE_COLS = {
-    "Pts Against": "PtsAg",
-    "Non-Rim Against": "Non rim ag",
-    "TOV Forced": "TOV Forced",
-    "OReb Against": "OReb Ag",
-    "Def Reb": "Def Reb",
-    "FTA Against": "FTA Ag",
-    "Rim Att Against": "RimAtt Ag",
-    "3PA Against": "ThreePA Ag",
-}
-
 @st.cache_data(show_spinner=False)
 def load_possessions_from_xlsx(xlsx_path: str) -> pd.DataFrame:
     df = pd.read_excel(xlsx_path, sheet_name="Possessions")
-    # Drop any completely unnamed trailing columns
     df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")]
-    # Normalize column names (strip)
     df.columns = [str(c).strip() for c in df.columns]
-    # Basic validation
+
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-    # Coerce numeric columns
+
     numeric_cols = [
         "PtsFor","PtsAg","TOV","TOV Forced","OReb","OReb Ag","Def Reb","OppDefReb",
         "FTA For","FTA Ag","RimAtt","RimAtt Ag","ThreePA","ThreePA Ag","Non rim","Non rim ag",
@@ -152,28 +130,16 @@ def load_possessions_from_xlsx(xlsx_path: str) -> pd.DataFrame:
     for c in numeric_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # Clean players
     for p in ["P1","P2","P3","P4","P5"]:
         df[p] = df[p].astype(str).str.strip()
         df.loc[df[p].isin(["", "nan", "None", "NaN"]), p] = ""
 
-    df["Side"] = df["Side"].astype(str).str.strip().str.title()  # Off / Def
     return df
 
-def lineup_key(players: List[str], k: int) -> Tuple[str, ...]:
-    clean = [p for p in players if p]
-    clean = sorted(clean)
-    if len(clean) < k:
-        return tuple()
-    return tuple(clean[:k])  # only used when k == len(clean) in 1-man? (we will use combos below)
-
 def explode_to_combos(df: pd.DataFrame, k: int) -> pd.DataFrame:
-    """
-    For each row, generate all combinations of size k from P1..P5, order-insensitive.
-    """
     records = []
     player_cols = ["P1","P2","P3","P4","P5"]
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         players = [row[c] for c in player_cols if row[c]]
         if len(players) < k:
             continue
@@ -191,7 +157,6 @@ def aggregate_lineups(df_poss: pd.DataFrame, k: int) -> pd.DataFrame:
     if dfc.empty:
         return dfc
 
-    # Aggregate sums
     sum_cols = [
         "PtsFor","PtsAg","TOV","TOV Forced","OReb","OReb Ag","Def Reb","OppDefReb",
         "FTA For","FTA Ag","RimAtt","RimAtt Ag","ThreePA","ThreePA Ag","Non rim","Non rim ag",
@@ -199,24 +164,21 @@ def aggregate_lineups(df_poss: pd.DataFrame, k: int) -> pd.DataFrame:
     ]
     g = dfc.groupby("Lineup", as_index=False)[sum_cols].sum()
 
-    # Derived dashboard metrics
-    # Protect divide-by-zero
+    # Derived metrics (protect divide-by-zero)
     g["ORTG"] = (100.0 * g["PtsFor"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
     g["DRTG"] = (100.0 * g["PtsAg"] / g["DefPoss"].replace(0, pd.NA)).fillna(0)
     g["NRTG"] = g["ORTG"] - g["DRTG"]
     g["TovR"] = (g["TOV"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
     g["RimR"] = (g["RimAtt"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
     g["3PR"]  = (g["ThreePA"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
-
-    # Convenience possessions
     g["TotalPoss"] = g["OffPoss"] + g["DefPoss"]
     return g
 
 def apply_per100(df: pd.DataFrame, per100: bool) -> pd.DataFrame:
     out = df.copy()
-    rate_cols = ["TovR","RimR","3PR"]
     if per100:
-        out[rate_cols] = out[rate_cols] * 100.0
+        for c in ["TovR","RimR","3PR"]:
+            out[c] = out[c] * 100.0
     return out
 
 def round_1_decimal(df: pd.DataFrame) -> pd.DataFrame:
@@ -232,14 +194,14 @@ def round_1_decimal(df: pd.DataFrame) -> pd.DataFrame:
 def stat_rank_table(df_lineups: pd.DataFrame, title: str, metric_map: Dict[str, str], poss_col: str):
     st.subheader(title)
 
-    cols = st.columns([2, 1, 3, 3])
-    with cols[0]:
+    c1, c2, c3, c4 = st.columns([2, 1, 3, 3])
+    with c1:
         metric_label = st.selectbox("Rank by", list(metric_map.keys()), key=f"{title}_metric")
-    with cols[1]:
+    with c2:
         ascending = st.toggle("Low is better", value=False, key=f"{title}_asc")
-    with cols[2]:
+    with c3:
         min_poss = st.number_input(f"Minimum {poss_col}", min_value=0.0, value=25.0, step=1.0, key=f"{title}_minposs")
-    with cols[3]:
+    with c4:
         topn = st.number_input("Show top N", min_value=10, value=50, step=10, key=f"{title}_topn")
 
     col = metric_map[metric_label]
@@ -247,10 +209,8 @@ def stat_rank_table(df_lineups: pd.DataFrame, title: str, metric_map: Dict[str, 
     view = df_lineups.copy()
     if poss_col in view.columns:
         view = view[view[poss_col] >= float(min_poss)]
-
     view = view.sort_values(col, ascending=bool(ascending)).head(int(topn))
 
-    # Put lineup + possessions + chosen metric first
     front = ["Lineup", poss_col, col]
     other = [c for c in view.columns if c not in front]
     view = view[front + other]
@@ -258,52 +218,80 @@ def stat_rank_table(df_lineups: pd.DataFrame, title: str, metric_map: Dict[str, 
     st.dataframe(round_1_decimal(view), use_container_width=True, hide_index=True)
 
 ###############################################################################
-# App state: login + file persistence
+# Auth UI
 ###############################################################################
 def logout():
-    st.session_state.pop("username", None)
+    st.session_state.pop("email", None)
     st.session_state.pop("data_path", None)
 
-def login_block():
+def login_or_signup():
     st.title("Lineup Tracker")
-    c1, c2 = st.columns(2)
 
-    with c1:
-        st.subheader("Log in")
-        u = st.text_input("Username", key="login_u")
-        p = st.text_input("Password", type="password", key="login_p")
-        if st.button("Log in", use_container_width=True):
-            ok, msg = authenticate(u, p)
-            if ok:
-                st.session_state["username"] = u
-                st.success(msg)
-                # If they already uploaded a file before, load it automatically
-                up = user_upload_path(u)
-                if up.exists():
-                    st.session_state["data_path"] = str(up)
-            else:
-                st.error(msg)
+    if "auth_view" not in st.session_state:
+        st.session_state["auth_view"] = "login"
 
-    with c2:
-        st.subheader("Create account")
-        nu = st.text_input("New username (3–24 chars; letters/numbers/_)", key="new_u")
-        npw = st.text_input("New password (8+ chars)", type="password", key="new_p")
-        if st.button("Create account", use_container_width=True):
-            ok, msg = create_user(nu, npw)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+    left, center, right = st.columns([1, 1.2, 1])
+    with center:
+        if st.session_state["auth_view"] == "login":
+            st.markdown("### Log in")
+            with st.form("login_form", clear_on_submit=False):
+                email = st.text_input("Email", key="login_email")
+                password = st.text_input("Password", type="password", key="login_pw")
+                submitted = st.form_submit_button("Log in", use_container_width=True)
+
+            if submitted:
+                ok, msg = authenticate(email, password)
+                if ok:
+                    email = (email or "").strip().lower()
+                    st.session_state["email"] = email
+                    up = user_upload_path(email)
+                    if up.exists():
+                        st.session_state["data_path"] = str(up)
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            st.markdown("---")
+            # Clickable word vibe: secondary button that just flips the view
+            cols = st.columns([1, 1, 1])
+            with cols[1]:
+                if st.button("Create account", type="secondary", use_container_width=True):
+                    st.session_state["auth_view"] = "signup"
+                    st.rerun()
+
+        else:
+            st.markdown("### Create account")
+            with st.form("create_form", clear_on_submit=False):
+                email = st.text_input("Email", key="new_email")
+                password = st.text_input("Password (8+ chars)", type="password", key="new_pw")
+                created = st.form_submit_button("Create account", use_container_width=True)
+
+            if created:
+                ok, msg = create_user(email, password)
+                if ok:
+                    st.success(msg)
+                    st.info("Now log in with your email and password.")
+                    st.session_state["auth_view"] = "login"
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            if st.button("Back to log in", use_container_width=True):
+                st.session_state["auth_view"] = "login"
+                st.rerun()
+
+    st.caption("Tip: Upload your Excel once; it auto-loads whenever you log back in.")
 
 ###############################################################################
-# Main
+# Main app
 ###############################################################################
-if "username" not in st.session_state:
-    login_block()
+if "email" not in st.session_state:
+    login_or_signup()
     st.stop()
 
-username = st.session_state["username"]
-st.sidebar.success(f"Logged in as: {username}")
+email = st.session_state["email"]
+st.sidebar.success(f"Logged in: {email}")
 if st.sidebar.button("Log out"):
     logout()
     st.rerun()
@@ -314,10 +302,10 @@ st.title("Lineup Tracker")
 st.sidebar.header("Data")
 uploaded = st.sidebar.file_uploader("Upload Lineup_Tracker Excel (.xlsx)", type=["xlsx"])
 if uploaded is not None:
-    save_path = user_upload_path(username)
+    save_path = user_upload_path(email)
     save_path.write_bytes(uploaded.getbuffer())
     st.session_state["data_path"] = str(save_path)
-    st.sidebar.success("Saved. This file will load automatically next time you log in.")
+    st.sidebar.success("Saved. This file auto-loads next time you log in.")
 
 data_path = st.session_state.get("data_path")
 if not data_path or not Path(data_path).exists():
@@ -326,7 +314,7 @@ if not data_path or not Path(data_path).exists():
 
 # Controls
 st.sidebar.header("Settings")
-lineup_size = st.sidebar.slider("Lineup size", min_value=1, max_value=5, value=5, step=1)
+lineup_size = st.sidebar.slider("Lineup size", 1, 5, 5, 1)
 min_total_poss = st.sidebar.number_input("Minimum total possessions (OffPoss+DefPoss)", min_value=0.0, value=50.0, step=1.0)
 per100_toggle = st.sidebar.toggle("Show rates per 100 possessions", value=True)
 show_raw_columns = st.sidebar.toggle("Show raw sum columns", value=False)
@@ -352,10 +340,11 @@ tabs = st.tabs(["Dashboard", "Offense", "Defense"])
 
 with tabs[0]:
     st.subheader(f"Dashboard — {lineup_size}-Man Lineups")
-    st.caption("Metrics: ORTG=100*PtsFor/OffPoss, DRTG=100*PtsAg/DefPoss, NRTG=ORTG-DRTG, "
-               "TovR=TOVfor/OffPoss, RimR=RimAttFor/OffPoss, 3PR=ThreePA_For/OffPoss.")
+    st.caption(
+        "Metrics: ORTG=100*PtsFor/OffPoss, DRTG=100*PtsAg/DefPoss, NRTG=ORTG-DRTG, "
+        "TovR=TOVfor/OffPoss, RimR=RimAttFor/OffPoss, 3PR=ThreePA_For/OffPoss."
+    )
 
-    # Sort controls
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         sort_metric = st.selectbox("Sort by", ["NRTG", "ORTG", "DRTG", "TovR", "RimR", "3PR", "TotalPoss"])
@@ -366,14 +355,11 @@ with tabs[0]:
 
     base_cols = ["Lineup", "TotalPoss", "OffPoss", "DefPoss", "ORTG", "DRTG", "NRTG", "TovR", "RimR", "3PR"]
     view = agg.sort_values(sort_metric, ascending=bool(asc)).head(int(topn))
-
     if not show_raw_columns:
         view = view[base_cols]
     st.dataframe(view, use_container_width=True, hide_index=True)
 
 with tabs[1]:
-    st.subheader("Offense")
-    # For offense ranking, use OffPoss threshold since metrics are offensive events
     metric_map = {
         "Pts For": "PtsFor",
         "TOV": "TOV",
@@ -390,7 +376,6 @@ with tabs[1]:
     stat_rank_table(agg, "Rank offensive lineups", metric_map, poss_col="OffPoss")
 
 with tabs[2]:
-    st.subheader("Defense")
     metric_map = {
         "Pts Against": "PtsAg",
         "Non-Rim Against": "Non rim ag",
