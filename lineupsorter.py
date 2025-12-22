@@ -348,7 +348,7 @@ with tabs[0]:
     with c2:
         asc = st.toggle("Ascending", value=False)
     with c3:
-        topn = st.number_input("Show top N", min_value=10, value=50, step=10)
+        topn = st.number_input("Show Top", min_value=5, value=25, step=5)
 
     base_cols = ["Lineup", "TotalPoss", "OffPoss", "DefPoss", "ORTG", "DRTG", "NRTG", "TovR", "RimR", "3PR"]
     view = agg.sort_values(sort_metric, ascending=bool(asc)).head(int(topn))
