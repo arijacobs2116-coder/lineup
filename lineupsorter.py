@@ -4,171 +4,267 @@ import numpy as np
 
 st.set_page_config(page_title="Lineup Tracker", layout="wide")
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def clean_name(x: object) -> str:
-    if pd.isna(x):
-        return ""
-    s = str(x).strip()
-    # normalize double spaces
-    s = " ".join(s.split())
-    return s.upper()
+# ----------------------------
+# Config
+# ----------------------------
+SHEET_NAME = "Possessions"  # your workbook uses this sheet
 
-def lineup_key_from_row(row: pd.Series) -> str:
-    players = [clean_name(row.get(f"P{i}", "")) for i in range(1, 6)]
-    players = [p for p in players if p != ""]
+OFFENSE_STATS = {
+    "Pts For": "PtsFor",
+    "TOV": "TOV",
+    "Off Reb": "OReb",
+    "Opp Def Reb": "OppDefReb",
+    "FTA For": "FTA For",
+    "Rim Attempts": "RimAtt",
+    "3P Attempts": "ThreePA",
+    "Non-Paint 3": "NonPaint3",
+    "Action 3": "Action3",
+    "Transition 3": "Transition3",
+    "Paint 3": "Paint3",
+}
+
+DEFENSE_STATS = {
+    "Pts Against": "PtsAg",
+    "Non-Rim Against": "Non rim ag",
+    "TOV Forced": "TOV Forced",
+    "OReb Against": "OReb Ag",
+    "Def Reb": "Def Reb",
+    "FTA Against": "FTA Ag",
+    "Rim Attempts Against": "RimAtt Ag",
+    "3P Attempts Against": "ThreePA Ag",
+}
+
+PLAYER_COLS = ["P1", "P2", "P3", "P4", "P5"]
+SIDE_COL = "Side"
+OFF_POSS_COL = "OffPoss"
+DEF_POSS_COL = "DefPoss"
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def normalize_player(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    # Keep original casing if you want; I normalize to upper for stable grouping
+    return " ".join(s.split()).upper()
+
+
+def make_lineup_key(row) -> str:
+    players = [normalize_player(row.get(c)) for c in PLAYER_COLS]
+    players = [p for p in players if p is not None]
+    if len(players) != 5:
+        return None
     players_sorted = sorted(players)
     return " | ".join(players_sorted)
 
-def add_lineup_key(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["LINEUP_KEY"] = df.apply(lineup_key_from_row, axis=1)
-    return df
 
-def safe_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    df = df.copy()
+def safe_numeric(df, cols):
     for c in cols:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-        else:
-            df[c] = 0
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-def summarize_side(df: pd.DataFrame, side_value: str, stat_cols: list[str], poss_col: str) -> pd.DataFrame:
-    # Filter side
-    d = df[df["Side"].astype(str).str.strip().str.upper() == side_value].copy()
 
-    # possessions: use OffPoss/DefPoss if present; otherwise count rows
-    if poss_col in d.columns:
-        d[poss_col] = pd.to_numeric(d[poss_col], errors="coerce").fillna(0)
-        d["POSS"] = d[poss_col]
-    else:
-        d["POSS"] = 1
+def load_possessions_sheet(uploaded_file) -> pd.DataFrame:
+    df = pd.read_excel(uploaded_file, sheet_name=SHEET_NAME, engine="openpyxl")
 
-    d = safe_numeric(d, stat_cols + ["POSS"])
+    # Drop completely empty rows
+    df = df.dropna(how="all")
 
-    # Group
-    g = (
-        d.groupby("LINEUP_KEY", as_index=False)
-        .agg({**{c: "sum" for c in stat_cols}, "POSS": "sum"})
+    # Normalize Side
+    if SIDE_COL in df.columns:
+        df[SIDE_COL] = df[SIDE_COL].astype(str).str.strip().str.title()
+
+    # Build lineup key
+    df["Lineup"] = df.apply(make_lineup_key, axis=1)
+    df = df[df["Lineup"].notna()].copy()
+
+    # Ensure numeric for all potential stat columns + poss columns
+    numeric_cols = (
+        list(OFFENSE_STATS.values())
+        + list(DEFENSE_STATS.values())
+        + [OFF_POSS_COL, DEF_POSS_COL]
     )
+    df = safe_numeric(df, numeric_cols)
 
-    # Per-100 possessions
-    for c in stat_cols:
-        g[f"{c}_per100"] = np.where(g["POSS"] > 0, (g[c] / g["POSS"]) * 100, 0)
+    return df
 
-    # Split out player display columns for readability (optional)
-    # We'll keep the key and also provide 5 player columns:
-    players = g["LINEUP_KEY"].str.split(r"\s*\|\s*", expand=True)
-    for i in range(5):
-        col = players[i] if i in players.columns else ""
-        g[f"P{i+1}"] = col
 
-    # Put columns in a nice order
-    front = ["P1", "P2", "P3", "P4", "P5", "POSS"]
-    keep = front + stat_cols + [f"{c}_per100" for c in stat_cols]
-    keep = [c for c in keep if c in g.columns]
-    return g[keep].sort_values("POSS", ascending=False)
+def aggregate_lineups(df: pd.DataFrame, side: str, stats_map: dict, poss_col: str) -> pd.DataFrame:
+    """
+    Aggregates totals by lineup for the given side.
+    Returns a dataframe with totals + possessions + per100 columns.
+    """
+    d = df[df[SIDE_COL].str.upper() == side.upper()].copy()
 
-# -----------------------------
+    # Keep only needed columns that exist
+    stat_cols = [c for c in stats_map.values() if c in d.columns]
+    keep_cols = ["Lineup", poss_col] + stat_cols
+    d = d[keep_cols].copy()
+
+    # Fill NaNs with 0 for aggregation (common for side-specific stats)
+    for c in stat_cols + [poss_col]:
+        if c in d.columns:
+            d[c] = d[c].fillna(0)
+
+    grouped = d.groupby("Lineup", as_index=False).sum(numeric_only=True)
+
+    # Build per100 columns
+    poss = grouped[poss_col].replace(0, np.nan)
+    for label, col in stats_map.items():
+        if col not in grouped.columns:
+            continue
+        grouped[f"{label} (per100)"] = (grouped[col] / poss) * 100
+
+    # Friendly display columns (raw)
+    rename_raw = {v: k for k, v in stats_map.items() if v in grouped.columns}
+    grouped = grouped.rename(columns=rename_raw)
+
+    # Move possessions up front
+    grouped = grouped.rename(columns={poss_col: "Possessions"})
+    cols_front = ["Lineup", "Possessions"]
+    other_cols = [c for c in grouped.columns if c not in cols_front]
+    grouped = grouped[cols_front + other_cols]
+
+    # Sort stable default: possessions desc
+    grouped = grouped.sort_values(["Possessions"], ascending=False).reset_index(drop=True)
+    return grouped
+
+
+def build_display_table(agg: pd.DataFrame, per100: bool, stats_map: dict) -> pd.DataFrame:
+    """
+    Returns the table users see (either raw or per100),
+    with numeric rounding for readability.
+    """
+    if agg.empty:
+        return agg
+
+    base_cols = ["Lineup", "Possessions"]
+
+    if per100:
+        per100_cols = [f"{k} (per100)" for k in stats_map.keys() if f"{k} (per100)" in agg.columns]
+        out = agg[base_cols + per100_cols].copy()
+        # Round per100 stats
+        for c in per100_cols:
+            out[c] = out[c].astype(float).round(2)
+        return out
+    else:
+        raw_cols = [k for k in stats_map.keys() if k in agg.columns]
+        out = agg[base_cols + raw_cols].copy()
+        # Round raw (mostly ints anyway)
+        for c in raw_cols:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+            if c.lower().startswith("pts") or "Attempts" in c or "Reb" in c or "TOV" in c or "FTA" in c or "3" in c:
+                out[c] = out[c].fillna(0).round(0).astype(int)
+        return out
+
+
+# ----------------------------
 # UI
-# -----------------------------
-st.title("Lineup Tracker (Upload → Group 5-Man Lineups → Rank)")
+# ----------------------------
+st.title("5-Man Lineup Rankings")
 
-uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+uploaded = st.file_uploader("Upload Lineup Tracker Excel (.xlsx)", type=["xlsx"])
 
 if not uploaded:
-    st.info("Upload an .xlsx file to begin.")
+    st.info("Upload your Excel file to begin.")
     st.stop()
 
-# Read the Possessions sheet
 try:
-    raw = pd.read_excel(uploaded, sheet_name="Possessions")
+    df = load_possessions_sheet(uploaded)
 except Exception as e:
-    st.error(f"Could not read sheet 'Possessions'. Error: {e}")
+    st.error(f"Could not read sheet '{SHEET_NAME}'. {e}")
     st.stop()
 
-needed_cols = ["Side", "P1", "P2", "P3", "P4", "P5"]
-missing = [c for c in needed_cols if c not in raw.columns]
-if missing:
-    st.error(f"Missing required columns in 'Possessions' sheet: {missing}")
-    st.stop()
-
-raw = add_lineup_key(raw)
-
-# Minimum possessions threshold control
-st.subheader("Filters")
-min_poss = st.number_input("Minimum possessions threshold", min_value=0, value=20, step=1)
+# Global switch: per100 or not
+per100_toggle = st.toggle("Show stats per 100 possessions", value=True)
 
 tab_off, tab_def = st.tabs(["Offense", "Defense"])
 
-# -----------------------------
-# OFFENSE TAB
-# -----------------------------
 with tab_off:
-    st.header("Offense")
+    st.subheader("Offense")
 
-    off_stat_cols = [
-        "PtsFor",        # pts for
-        "TOV",           # tov
-        "OReb",          # offensive rebounds
-        "OppDefReb",     # oppdefrebounds
-        "FTA For",       # fta for
-        "RimAtt",        # rim attempts
-        "ThreePA",       # 3p attempts
-        "NonPaint3",     # non-paint 3
-        "Action3",       # action 3
-        "Transition3",   # transition 3
-        "Paint3",        # paint 3
-    ]
+    min_poss_off = st.number_input(
+        "Minimum Off Possessions",
+        min_value=0,
+        value=20,
+        step=5,
+        help="Lineups with fewer OffPoss than this will be hidden.",
+    )
 
-    off_summary = summarize_side(raw, side_value="OFF", stat_cols=off_stat_cols, poss_col="OffPoss")
-    off_summary = off_summary[off_summary["POSS"] >= min_poss].copy()
+    agg_off = aggregate_lineups(df, side="Off", stats_map=OFFENSE_STATS, poss_col=OFF_POSS_COL)
+    agg_off = agg_off[agg_off["Possessions"] >= min_poss_off].copy()
 
-    st.write(f"Lineups meeting threshold: **{len(off_summary)}**")
+    display_off = build_display_table(agg_off, per100=per100_toggle, stats_map=OFFENSE_STATS)
 
-    # Ranking controls
-    metric_options = {c: f"{c}_per100" for c in off_stat_cols}
-    chosen = st.selectbox("Rank by (per 100 possessions)", list(metric_options.keys()), index=0)
+    if display_off.empty:
+        st.warning("No offensive lineups match your possessions threshold.")
+    else:
+        sort_choices = [c for c in display_off.columns if c not in ["Lineup"]]
+        default_sort = "Pts For (per100)" if per100_toggle and "Pts For (per100)" in sort_choices else (
+            "Pts For" if "Pts For" in sort_choices else sort_choices[0]
+        )
 
-    sort_col = metric_options[chosen]
-    off_summary = off_summary.sort_values(sort_col, ascending=False)
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            sort_col = st.selectbox("Sort / Rank by", sort_choices, index=sort_choices.index(default_sort))
+        with c2:
+            descending = st.toggle("Descending", value=True)
 
-    # Show
-    st.dataframe(off_summary, use_container_width=True)
+        display_off = display_off.sort_values(sort_col, ascending=not descending).reset_index(drop=True)
+        display_off.insert(0, "Rank", np.arange(1, len(display_off) + 1))
 
-# -----------------------------
-# DEFENSE TAB
-# -----------------------------
+        st.dataframe(display_off, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "Download Offense Table (CSV)",
+            data=display_off.to_csv(index=False).encode("utf-8"),
+            file_name="lineups_offense.csv",
+            mime="text/csv",
+        )
+
 with tab_def:
-    st.header("Defense")
+    st.subheader("Defense")
 
-    def_stat_cols = [
-        "PtsAg",         # pts against
-        "Non rim ag",    # non-rim against
-        "TOV Forced",    # tov forced
-        "OReb Ag",       # Oreb against
-        "Def Reb",       # def reb
-        "FTA Ag",        # FTA against
-        "RimAtt Ag",     # rim attempt against
-        "ThreePA Ag",    # three point attempt against
-    ]
+    min_poss_def = st.number_input(
+        "Minimum Def Possessions",
+        min_value=0,
+        value=20,
+        step=5,
+        help="Lineups with fewer DefPoss than this will be hidden.",
+    )
 
-    def_summary = summarize_side(raw, side_value="DEF", stat_cols=def_stat_cols, poss_col="DefPoss")
-    def_summary = def_summary[def_summary["POSS"] >= min_poss].copy()
+    agg_def = aggregate_lineups(df, side="Def", stats_map=DEFENSE_STATS, poss_col=DEF_POSS_COL)
+    agg_def = agg_def[agg_def["Possessions"] >= min_poss_def].copy()
 
-    st.write(f"Lineups meeting threshold: **{len(def_summary)}**")
+    display_def = build_display_table(agg_def, per100=per100_toggle, stats_map=DEFENSE_STATS)
 
-    metric_options = {c: f"{c}_per100" for c in def_stat_cols}
-    chosen = st.selectbox("Rank by (per 100 possessions)", list(metric_options.keys()), index=0)
+    if display_def.empty:
+        st.warning("No defensive lineups match your possessions threshold.")
+    else:
+        sort_choices = [c for c in display_def.columns if c not in ["Lineup"]]
+        default_sort = "Pts Against (per100)" if per100_toggle and "Pts Against (per100)" in sort_choices else (
+            "Pts Against" if "Pts Against" in sort_choices else sort_choices[0]
+        )
 
-    sort_col = metric_options[chosen]
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            sort_col = st.selectbox("Sort / Rank by", sort_choices, index=sort_choices.index(default_sort))
+        with c2:
+            descending = st.toggle("Descending", value=False, help="For defense, you usually want ascending for points against.")
 
-    # Note: For defense, "better" might mean LOWER PtsAg_per100 etc.
-    # We'll add a toggle so you can flip direction easily.
-    ascending = st.toggle("Sort ascending (useful for 'against' stats like PtsAg)", value=True)
+        display_def = display_def.sort_values(sort_col, ascending=not descending).reset_index(drop=True)
+        display_def.insert(0, "Rank", np.arange(1, len(display_def) + 1))
 
-    def_summary = def_summary.sort_values(sort_col, ascending=ascending)
+        st.dataframe(display_def, use_container_width=True, hide_index=True)
 
-    st.dataframe(def_summary, use_container_width=True)
+        st.download_button(
+            "Download Defense Table (CSV)",
+            data=display_def.to_csv(index=False).encode("utf-8"),
+            file_name="lineups_defense.csv",
+            mime="text/csv",
+        )
