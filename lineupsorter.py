@@ -199,7 +199,7 @@ def stat_rank_table(df_lineups: pd.DataFrame, title: str, metric_map: Dict[str, 
     with c3:
         min_poss = st.number_input(f"Minimum {poss_col}", min_value=0.0, value=25.0, step=1.0, key=f"{title}_minposs")
     with c4:
-        topn = st.number_input("Show top N", min_value=10, value=50, step=10, key=f"{title}_topn")
+        topn = st.number_input("Show Top", min_value=5, value=500, step=10, key=f"{title}_topn")
 
     col = metric_map[metric_label]
 
@@ -316,7 +316,7 @@ if not data_path or not Path(data_path).exists():
 # Controls
 st.sidebar.header("Settings")
 lineup_size = st.sidebar.slider("Lineup size", 1, 5, 5, 1)
-min_total_poss = st.sidebar.number_input("Minimum total possessions (OffPoss+DefPoss)", min_value=0.0, value=50.0, step=1.0)
+min_total_poss = st.sidebar.number_input("Minimum total possessions (OffPoss+DefPoss)", min_value=0, value=50, step=1)
 per100_toggle = st.sidebar.toggle("Show rates per 100 possessions", value=True)
 show_raw_columns = st.sidebar.toggle("Show raw sum columns", value=False)
 
@@ -341,10 +341,6 @@ tabs = st.tabs(["Dashboard", "Offense", "Defense"])
 
 with tabs[0]:
     st.subheader(f"Dashboard — {lineup_size}-Man Lineups")
-    st.caption(
-        "Metrics: ORTG=100*PtsFor/OffPoss, DRTG=100*PtsAg/DefPoss, NRTG=ORTG-DRTG, "
-        "TovR=TOVfor/OffPoss, RimR=RimAttFor/OffPoss, 3PR=ThreePA_For/OffPoss."
-    )
 
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
