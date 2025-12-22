@@ -1,9 +1,8 @@
 import itertools
-import os
 import re
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -23,24 +22,24 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ###############################################################################
-# Auth helpers (SQLite + bcrypt) — Email-based accounts
+# Auth helpers (SQLite + bcrypt) — Username/password
 ###############################################################################
-EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+USERNAME_RE = re.compile(r"[A-Za-z0-9_]{3,24}")
 
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            email   TEXT PRIMARY KEY,
-            pw_hash BLOB NOT NULL
+            username TEXT PRIMARY KEY,
+            pw_hash  BLOB NOT NULL
         );
         """
     )
     return conn
 
-def _valid_email(email: str) -> bool:
-    return bool(EMAIL_RE.fullmatch((email or "").strip().lower()))
+def _valid_username(u: str) -> bool:
+    return bool(USERNAME_RE.fullmatch((u or "").strip()))
 
 def _hash_pw(password: str) -> bytes:
     salt = bcrypt.gensalt(rounds=12)
@@ -52,47 +51,46 @@ def _check_pw(password: str, pw_hash: bytes) -> bool:
     except Exception:
         return False
 
-def create_user(email: str, password: str) -> Tuple[bool, str]:
-    email = (email or "").strip().lower()
-    if not _valid_email(email):
-        return False, "Enter a valid email address."
+def create_user(username: str, password: str) -> Tuple[bool, str]:
+    username = (username or "").strip()
+    if not _valid_username(username):
+        return False, "Username must be 3–24 characters: letters, numbers, underscore."
     if password is None or len(password) < 8:
         return False, "Password must be at least 8 characters."
 
     conn = _get_conn()
     try:
-        cur = conn.execute("SELECT email FROM users WHERE email = ?", (email,))
+        cur = conn.execute("SELECT username FROM users WHERE username = ?", (username,))
         if cur.fetchone() is not None:
-            return False, "That email already exists."
+            return False, "That username already exists."
 
         conn.execute(
-            "INSERT INTO users(email, pw_hash) VALUES(?, ?)",
-            (email, _hash_pw(password)),
+            "INSERT INTO users(username, pw_hash) VALUES(?, ?)",
+            (username, _hash_pw(password)),
         )
         conn.commit()
         return True, "Account created."
     finally:
         conn.close()
 
-def authenticate(email: str, password: str) -> Tuple[bool, str]:
-    email = (email or "").strip().lower()
+def authenticate(username: str, password: str) -> Tuple[bool, str]:
+    username = (username or "").strip()
     conn = _get_conn()
     try:
-        cur = conn.execute("SELECT pw_hash FROM users WHERE email = ?", (email,))
+        cur = conn.execute("SELECT pw_hash FROM users WHERE username = ?", (username,))
         row = cur.fetchone()
         if row is None:
-            return False, "Invalid email or password."
+            return False, "Invalid username or password."
         pw_hash = row[0]
         if isinstance(pw_hash, memoryview):
             pw_hash = pw_hash.tobytes()
         ok = _check_pw(password, pw_hash)
-        return (ok, "Logged in." if ok else "Invalid email or password.")
+        return (ok, "Logged in." if ok else "Invalid username or password.")
     finally:
         conn.close()
 
-def user_upload_path(email: str) -> Path:
-    # simple filesystem-safe name
-    safe = re.sub(r"[^a-z0-9_.-]+", "_", (email or "").strip().lower())
+def user_upload_path(username: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_]+", "_", (username or "").strip())
     return UPLOAD_DIR / f"{safe}.xlsx"
 
 ###############################################################################
@@ -164,7 +162,6 @@ def aggregate_lineups(df_poss: pd.DataFrame, k: int) -> pd.DataFrame:
     ]
     g = dfc.groupby("Lineup", as_index=False)[sum_cols].sum()
 
-    # Derived metrics (protect divide-by-zero)
     g["ORTG"] = (100.0 * g["PtsFor"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
     g["DRTG"] = (100.0 * g["PtsAg"] / g["DefPoss"].replace(0, pd.NA)).fillna(0)
     g["NRTG"] = g["ORTG"] - g["DRTG"]
@@ -218,33 +215,58 @@ def stat_rank_table(df_lineups: pd.DataFrame, title: str, metric_map: Dict[str, 
     st.dataframe(round_1_decimal(view), use_container_width=True, hide_index=True)
 
 ###############################################################################
-# Auth UI
+# Auth UI (centered) — clickable word via query params
 ###############################################################################
 def logout():
-    st.session_state.pop("email", None)
+    st.session_state.pop("username", None)
     st.session_state.pop("data_path", None)
 
-def login_or_signup():
+def auth_page():
     st.title("Lineup Tracker")
 
-    if "auth_view" not in st.session_state:
-        st.session_state["auth_view"] = "login"
+    qp = st.query_params
+    view = qp.get("auth", "login")
+    if isinstance(view, list):  # compatibility
+        view = view[0] if view else "login"
 
     left, center, right = st.columns([1, 1.2, 1])
     with center:
-        if st.session_state["auth_view"] == "login":
+        if view == "signup":
+            st.markdown("### Create account")
+            with st.form("create_form", clear_on_submit=False):
+                username = st.text_input("Username", help="3–24 chars: letters/numbers/_")
+                password = st.text_input("Password (8+ chars)", type="password")
+                created = st.form_submit_button("Create account", use_container_width=True)
+
+            if created:
+                ok, msg = create_user(username, password)
+                if ok:
+                    st.success(msg)
+                    st.info("Now log in.")
+                    st.query_params["auth"] = "login"
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            st.markdown("---")
+            st.markdown("Already have an account? **Log in**")
+            if st.button("Back to log in", use_container_width=True):
+                st.query_params["auth"] = "login"
+                st.rerun()
+
+        else:
             st.markdown("### Log in")
             with st.form("login_form", clear_on_submit=False):
-                email = st.text_input("Email", key="login_email")
-                password = st.text_input("Password", type="password", key="login_pw")
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
                 submitted = st.form_submit_button("Log in", use_container_width=True)
 
             if submitted:
-                ok, msg = authenticate(email, password)
+                ok, msg = authenticate(username, password)
                 if ok:
-                    email = (email or "").strip().lower()
-                    st.session_state["email"] = email
-                    up = user_upload_path(email)
+                    username = (username or "").strip()
+                    st.session_state["username"] = username
+                    up = user_upload_path(username)
                     if up.exists():
                         st.session_state["data_path"] = str(up)
                     st.success(msg)
@@ -253,45 +275,24 @@ def login_or_signup():
                     st.error(msg)
 
             st.markdown("---")
-            # Clickable word vibe: secondary button that just flips the view
-            cols = st.columns([1, 1, 1])
-            with cols[1]:
-                if st.button("Create account", type="secondary", use_container_width=True):
-                    st.session_state["auth_view"] = "signup"
-                    st.rerun()
-
-        else:
-            st.markdown("### Create account")
-            with st.form("create_form", clear_on_submit=False):
-                email = st.text_input("Email", key="new_email")
-                password = st.text_input("Password (8+ chars)", type="password", key="new_pw")
-                created = st.form_submit_button("Create account", use_container_width=True)
-
-            if created:
-                ok, msg = create_user(email, password)
-                if ok:
-                    st.success(msg)
-                    st.info("Now log in with your email and password.")
-                    st.session_state["auth_view"] = "login"
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-            if st.button("Back to log in", use_container_width=True):
-                st.session_state["auth_view"] = "login"
-                st.rerun()
+            # A literal clickable word link
+            st.markdown(
+                "Don't have an account? "
+                "<a href='?auth=signup' style='text-decoration:none; font-weight:600;'>Create account</a>",
+                unsafe_allow_html=True,
+            )
 
     st.caption("Tip: Upload your Excel once; it auto-loads whenever you log back in.")
 
 ###############################################################################
 # Main app
 ###############################################################################
-if "email" not in st.session_state:
-    login_or_signup()
+if "username" not in st.session_state:
+    auth_page()
     st.stop()
 
-email = st.session_state["email"]
-st.sidebar.success(f"Logged in: {email}")
+username = st.session_state["username"]
+st.sidebar.success(f"Logged in: {username}")
 if st.sidebar.button("Log out"):
     logout()
     st.rerun()
@@ -302,7 +303,7 @@ st.title("Lineup Tracker")
 st.sidebar.header("Data")
 uploaded = st.sidebar.file_uploader("Upload Lineup_Tracker Excel (.xlsx)", type=["xlsx"])
 if uploaded is not None:
-    save_path = user_upload_path(email)
+    save_path = user_upload_path(username)
     save_path.write_bytes(uploaded.getbuffer())
     st.session_state["data_path"] = str(save_path)
     st.sidebar.success("Saved. This file auto-loads next time you log in.")
