@@ -2,7 +2,7 @@ import itertools
 import re
 import sqlite3
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import pandas as pd
 import streamlit as st
@@ -162,12 +162,14 @@ def aggregate_lineups(df_poss: pd.DataFrame, k: int) -> pd.DataFrame:
     ]
     g = dfc.groupby("Lineup", as_index=False)[sum_cols].sum()
 
+    # Derived metrics (protect divide-by-zero)
     g["ORTG"] = (100.0 * g["PtsFor"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
     g["DRTG"] = (100.0 * g["PtsAg"] / g["DefPoss"].replace(0, pd.NA)).fillna(0)
     g["NRTG"] = g["ORTG"] - g["DRTG"]
     g["TovR"] = (g["TOV"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
     g["RimR"] = (g["RimAtt"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
     g["3PR"]  = (g["ThreePA"] / g["OffPoss"].replace(0, pd.NA)).fillna(0)
+
     g["TotalPoss"] = g["OffPoss"] + g["DefPoss"]
     return g
 
@@ -186,15 +188,15 @@ def round_1_decimal(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def with_player_cols(df: pd.DataFrame, max_players: int = 5) -> pd.DataFrame:
-    """
-    Adds Player1..Player5 columns so lineups are always fully visible (no truncation),
-    regardless of lineup size.
-    """
     out = df.copy()
     players = out["Lineup"].astype(str).str.split(r"\s*\|\s*", regex=True)
     for i in range(1, max_players + 1):
         out[f"Player{i}"] = players.str.get(i - 1).fillna("")
     return out
+
+@st.cache_data(show_spinner=False)
+def precompute_aggs(df_poss_in: pd.DataFrame):
+    return {k: aggregate_lineups(df_poss_in, k) for k in range(1, 6)}
 
 ###############################################################################
 # UI helpers
@@ -219,15 +221,15 @@ def stat_rank_table(df_lineups: pd.DataFrame, title: str, metric_map: Dict[str, 
         view = view[view[poss_col] >= float(min_poss)]
     view = view.sort_values(col, ascending=bool(ascending)).head(int(topn))
 
-    front = [f"Player{i}" for i in range(1, 6)] + [poss_col, col]
-    front = [c for c in front if c in view.columns]
+    player_cols = [f"Player{i}" for i in range(1, 6) if f"Player{i}" in view.columns]
+    front = player_cols + [poss_col, col]
     other = [c for c in view.columns if c not in front]
     view = view[front + other]
 
     st.dataframe(round_1_decimal(view), use_container_width=True, hide_index=True)
 
 ###############################################################################
-# Auth UI (centered) — clickable word via query params
+# Auth UI (centered) — clickable Create account link via ?auth=signup
 ###############################################################################
 def logout():
     st.session_state.pop("username", None)
@@ -238,7 +240,7 @@ def auth_page():
 
     qp = st.query_params
     view = qp.get("auth", "login")
-    if isinstance(view, list):  # compatibility
+    if isinstance(view, list):
         view = view[0] if view else "login"
 
     left, center, right = st.columns([1, 1.2, 1])
@@ -261,7 +263,7 @@ def auth_page():
                     st.error(msg)
 
             st.markdown("---")
-            st.markdown("Already have an account? **Log in**")
+            st.markdown("Already have an account?")
             if st.button("Back to log in", use_container_width=True):
                 st.query_params["auth"] = "login"
                 st.rerun()
@@ -287,7 +289,6 @@ def auth_page():
                     st.error(msg)
 
             st.markdown("---")
-            # A literal clickable word link
             st.markdown(
                 "Don't have an account? "
                 "<a href='?auth=signup' style='text-decoration:none; font-weight:600;'>Create account</a>",
@@ -325,6 +326,17 @@ if not data_path or not Path(data_path).exists():
     st.info("Upload your Excel file in the sidebar to get started.")
     st.stop()
 
+# Load base data
+try:
+    df_poss = load_possessions_from_xlsx(data_path)
+except Exception as e:
+    st.error(f"Could not read sheet 'Possessions'. {e}")
+    st.stop()
+
+all_players = sorted(set([p for c in ["P1","P2","P3","P4","P5"] for p in df_poss[c].unique() if isinstance(p, str) and p.strip()]))
+
+agg_by_k = precompute_aggs(df_poss)
+
 # Controls
 st.sidebar.header("Settings")
 lineup_size = st.sidebar.slider("Lineup size", 1, 5, 5, 1)
@@ -332,23 +344,8 @@ min_total_poss = st.sidebar.number_input("Minimum total possessions (OffPoss+Def
 per100_toggle = st.sidebar.toggle("Show rates per 100 possessions", value=True)
 show_raw_columns = st.sidebar.toggle("Show raw sum columns", value=False)
 
-# Load + aggregate
-try:
-    df_poss = load_possessions_from_xlsx(data_path)
-except Exception as e:
-    st.error(f"Could not read sheet 'Possessions'. {e}")
-    st.stop()
-
-# Precompute aggregates for all lineup sizes (1–5) for quick lookup in Test Lineup tab
-@st.cache_data(show_spinner=False)
-def precompute_aggs(df_poss_in: pd.DataFrame):
-    return {k: aggregate_lineups(df_poss_in, k) for k in range(1, 6)}
-
-agg_by_k = precompute_aggs(df_poss)
-
-all_players = sorted(set([p for c in ['P1','P2','P3','P4','P5'] for p in df_poss[c].unique() if isinstance(p, str) and p.strip()]))
-
-agg = aggregate_lineups(df_poss, lineup_size)
+# Aggregate for selected lineup size (for main tables)
+agg = agg_by_k.get(int(lineup_size), pd.DataFrame()).copy()
 if agg.empty:
     st.warning("No lineups found for that lineup size.")
     st.stop()
@@ -356,11 +353,11 @@ if agg.empty:
 agg = agg[agg["TotalPoss"] >= float(min_total_poss)].copy()
 agg = apply_per100(agg, per100_toggle)
 agg = round_1_decimal(agg)
-
-# Add Player1..Player5 for display
 agg_view = with_player_cols(agg)
 
+###############################################################################
 # Tabs
+###############################################################################
 tabs = st.tabs(["Dashboard", "Comparison", "Test Lineup", "Offense", "Defense"])
 
 with tabs[0]:
@@ -384,17 +381,13 @@ with tabs[0]:
         view = view[base_cols]
     st.dataframe(view, use_container_width=True, hide_index=True)
 
-
 with tabs[1]:
     st.subheader("Comparison")
     st.caption(
-        "Pick any metrics below. Each lineup gets a rank for every selected metric, "
-        "then we average those ranks. **Lower average rank = better overall**."
+        "Pick metrics below. Each lineup gets a rank for every selected metric, then we average those ranks. "
+        "**Lower average rank = better overall**."
     )
 
-    # Define which direction is "better" for each metric
-    # True  -> higher is better
-    # False -> lower is better
     metric_defs = {
         "ORTG (higher better)": ("ORTG", True),
         "DRTG (lower better)": ("DRTG", False),
@@ -405,31 +398,21 @@ with tabs[1]:
     }
 
     st.markdown("#### Choose metrics")
-    # "Clickable boxes" -> checkboxes arranged in a row
-    # (Streamlit checkboxes are the most reliable clickable UI element for this.)
-    cols = st.columns(6)
-    selected_keys = []
+    cols = st.columns(len(metric_defs))
+    selected_labels: List[str] = []
     for i, label in enumerate(metric_defs.keys()):
-        with cols[i % 6]:
-            if st.checkbox(label, value=(label in st.session_state.get("cmp_selected", [])), key=f"cmp_{i}"):
-                selected_keys.append(label)
+        with cols[i]:
+            if st.checkbox(label, value=False, key=f"cmp_cb_{i}"):
+                selected_labels.append(label)
 
-    st.session_state["cmp_selected"] = selected_keys
-
-    if len(selected_keys) == 0:
+    if len(selected_labels) == 0:
         st.info("Select at least 1 metric to generate comparison rankings.")
     else:
-        # Build rank table
         tmp = agg_view.copy()
-
         rank_cols = []
-        for label in selected_keys:
+        for label in selected_labels:
             col, higher_better = metric_defs[label]
-            # Rank: 1 = best
-            tmp[f"Rank_{col}"] = tmp[col].rank(
-                ascending=not higher_better,
-                method="average"
-            )
+            tmp[f"Rank_{col}"] = tmp[col].rank(ascending=not higher_better, method="average")
             rank_cols.append(f"Rank_{col}")
 
         tmp["AvgRank"] = tmp[rank_cols].mean(axis=1)
@@ -441,8 +424,7 @@ with tabs[1]:
             show_rank_cols = st.toggle("Show component ranks", value=True, key="cmp_show_ranks")
 
         show_cols = ["Player1","Player2","Player3","Player4","Player5","TotalPoss","OffPoss","DefPoss"]
-        # Add selected metrics
-        for label in selected_keys:
+        for label in selected_labels:
             col, _ = metric_defs[label]
             show_cols.append(col)
         if show_rank_cols:
@@ -452,6 +434,76 @@ with tabs[1]:
         out = tmp.sort_values("AvgRank", ascending=True).head(int(topn))
         st.dataframe(round_1_decimal(out[show_cols]), use_container_width=True, hide_index=True)
 
+with tabs[2]:
+    st.subheader("Test Lineup")
+    st.caption(
+        "Pick up to 5 players. We’ll show the exact lineup’s aggregated stats (order doesn’t matter). "
+        "Leave boxes blank to test 1–4 player groups."
+    )
+
+    if st.button("Clear lineup", type="secondary"):
+        for k in ["tl_p1", "tl_p2", "tl_p3", "tl_p4", "tl_p5"]:
+            st.session_state[k] = ""
+        st.rerun()
+
+    def _opts(exclude):
+        return [""] + [p for p in all_players if p not in exclude]
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    picked = set()
+
+    with c1:
+        p1 = st.selectbox("Player 1", _opts(picked), key="tl_p1")
+        if p1: picked.add(p1)
+    with c2:
+        p2 = st.selectbox("Player 2", _opts(picked), key="tl_p2")
+        if p2: picked.add(p2)
+    with c3:
+        p3 = st.selectbox("Player 3", _opts(picked), key="tl_p3")
+        if p3: picked.add(p3)
+    with c4:
+        p4 = st.selectbox("Player 4", _opts(picked), key="tl_p4")
+        if p4: picked.add(p4)
+    with c5:
+        p5 = st.selectbox("Player 5", _opts(picked), key="tl_p5")
+        if p5: picked.add(p5)
+
+    selected = [p for p in [p1, p2, p3, p4, p5] if p]
+    if len(selected) == 0:
+        st.info("Select at least one player.")
+    else:
+        k = len(selected)
+        lineup_str = " | ".join(sorted(selected))
+
+        dfk = agg_by_k.get(k, pd.DataFrame()).copy()
+        if dfk.empty:
+            st.warning("No data available for that lineup size.")
+        else:
+            dfk = dfk.copy()
+            dfk["TotalPoss"] = dfk["OffPoss"] + dfk["DefPoss"]
+            dfk = dfk[dfk["TotalPoss"] >= float(min_total_poss)].copy()
+            dfk = apply_per100(dfk, per100_toggle)
+            dfk = round_1_decimal(dfk)
+            dfk_view = with_player_cols(dfk)
+
+            row = dfk_view[dfk_view["Lineup"] == lineup_str]
+            if row.empty:
+                st.warning("That exact lineup isn’t in the data (after the current possession threshold).")
+            else:
+                st.markdown(f"#### {k}-Man: {lineup_str}")
+                player_cols = [f"Player{i}" for i in range(1, k + 1)]
+                base_cols = player_cols + ["TotalPoss","OffPoss","DefPoss","ORTG","DRTG","NRTG","TovR","RimR","3PR"]
+                st.dataframe(row[base_cols], use_container_width=True, hide_index=True)
+
+                st.markdown("##### Offense/Defense detail")
+                detail_cols = [
+                    "PtsFor","PtsAg","TOV","TOV Forced","OReb","OReb Ag","Def Reb","OppDefReb",
+                    "FTA For","FTA Ag","RimAtt","RimAtt Ag","ThreePA","ThreePA Ag",
+                    "Non rim","Non rim ag","NonPaint3","Action3","Transition3","Paint3"
+                ]
+                detail_cols = [c for c in detail_cols if c in row.columns]
+                st.dataframe(row[player_cols + detail_cols], use_container_width=True, hide_index=True)
 
 with tabs[3]:
     metric_map = {
@@ -468,73 +520,6 @@ with tabs[3]:
         "Paint 3": "Paint3",
     }
     stat_rank_table(agg_view, "Rank offensive lineups", metric_map, poss_col="OffPoss")
-
-
-with tabs[2]:
-    st.subheader("Test Lineup")
-    st.caption(
-        "Pick up to 5 players. We’ll show the exact lineup’s aggregated stats "
-        "(order doesn’t matter). Leave boxes blank to test 1–4 player groups."
-    )
-
-    # Five rows (selectboxes). Blank allowed.
-    c1, c2, c3, c4, c5 = st.columns(5)
-    opts = [""] + all_players
-
-    with c1:
-        p1 = st.selectbox("Player 1", opts, key="tl_p1")
-    with c2:
-        p2 = st.selectbox("Player 2", opts, key="tl_p2")
-    with c3:
-        p3 = st.selectbox("Player 3", opts, key="tl_p3")
-    with c4:
-        p4 = st.selectbox("Player 4", opts, key="tl_p4")
-    with c5:
-        p5 = st.selectbox("Player 5", opts, key="tl_p5")
-
-    selected = [p for p in [p1, p2, p3, p4, p5] if p]
-    if len(selected) == 0:
-        st.info("Select at least one player.")
-    elif len(set(selected)) != len(selected):
-        st.error("Remove duplicates — each player can only be selected once.")
-    else:
-        k = len(selected)
-        lineup_str = " | ".join(sorted(selected))
-
-        dfk = agg_by_k.get(k)
-        if dfk is None or dfk.empty:
-            st.warning("No data available for that lineup size.")
-        else:
-            # Apply the same filters/toggles as the rest of the app
-            tmp = dfk.copy()
-            tmp["TotalPoss"] = tmp["OffPoss"] + tmp["DefPoss"]
-            tmp = tmp[tmp["TotalPoss"] >= float(min_total_poss)].copy()
-            tmp = apply_per100(tmp, per100_toggle)
-            tmp = round_1_decimal(tmp)
-
-            tmp_view = with_player_cols(tmp)
-
-            row = tmp_view[tmp_view["Lineup"] == lineup_str]
-            if row.empty:
-                st.warning("That exact lineup isn’t in the data (after the current possession threshold).")
-                st.caption("Try lowering the minimum total possessions in the sidebar, or test fewer/more players.")
-            else:
-                st.markdown(f"#### {k}-Man: {lineup_str}")
-
-                base_cols = ["Player1","Player2","Player3","Player4","Player5","TotalPoss","OffPoss","DefPoss","ORTG","DRTG","NRTG","TovR","RimR","3PR"]
-                st.dataframe(row[base_cols], use_container_width=True, hide_index=True)
-
-                st.markdown("##### Offense/Defense detail")
-                detail_cols = [
-                    "PtsFor","PtsAg","TOV","TOV Forced","OReb","OReb Ag","Def Reb","OppDefReb",
-                    "FTA For","FTA Ag","RimAtt","RimAtt Ag","ThreePA","ThreePA Ag",
-                    "Non rim","Non rim ag","NonPaint3","Action3","Transition3","Paint3"
-                ]
-                # Only show cols that exist (safety)
-                detail_cols = [c for c in detail_cols if c in row.columns]
-                st.dataframe(row[["Player1","Player2","Player3","Player4","Player5"] + detail_cols], use_container_width=True, hide_index=True)
-
-
 
 with tabs[4]:
     metric_map = {
