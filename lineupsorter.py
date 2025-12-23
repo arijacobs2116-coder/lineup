@@ -362,11 +362,7 @@ tabs = st.tabs(["Dashboard", "Comparison", "Test Lineup", "Offense", "Defense"])
 
 with tabs[0]:
     st.subheader(f"Dashboard — {lineup_size}-Man Lineups")
-    st.caption(
-        "Metrics: ORTG=100*PtsFor/OffPoss, DRTG=100*PtsAg/DefPoss, NRTG=ORTG-DRTG, "
-        "TovR=TOVfor/OffPoss, RimR=RimAttFor/OffPoss, 3PR=ThreePA_For/OffPoss."
-    )
-
+    
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         sort_metric = st.selectbox("Sort by", ["NRTG", "ORTG", "DRTG", "TovR", "RimR", "3PR", "TotalPoss"])
@@ -419,7 +415,7 @@ with tabs[1]:
 
         c1, c2 = st.columns([2, 1])
         with c1:
-            topn = st.number_input("Show top N", min_value=10, value=50, step=10, key="cmp_topn")
+            topn = st.number_input("Show Top", min_value=10, value=50, step=10, key="cmp_topn")
         with c2:
             show_rank_cols = st.toggle("Show component ranks", value=True, key="cmp_show_ranks")
 
