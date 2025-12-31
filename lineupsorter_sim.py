@@ -2,12 +2,11 @@ import itertools
 import math
 import re
 import sqlite3
-import math
-from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Tuple, List
 
 import numpy as np
+
 import pandas as pd
 import streamlit as st
 import bcrypt
@@ -428,6 +427,58 @@ def _read_player_stats_csv(uploaded_file) -> pd.DataFrame:
 
     return df
 
+
+
+def _try_shot_mix_from_pdf(uploaded_pdf) -> Dict[str, float] | None:
+    """Best-effort: extract team-level shot mix from a CBB Analytics-style PDF.
+
+    Returns a dict like:
+      {"rim_share": 0.32, "mid_share": 0.29, "three_share": 0.39}
+    If parsing fails, returns None.
+    """
+    if uploaded_pdf is None:
+        return None
+    try:
+        import io
+        from PyPDF2 import PdfReader  # type: ignore
+        data = uploaded_pdf.getvalue() if hasattr(uploaded_pdf, "getvalue") else uploaded_pdf.read()
+        reader = PdfReader(io.BytesIO(data))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        text = re.sub(r"\s+", " ", text)
+
+        # Common labels in shot-profile style PDFs
+        # We'll search for first % occurrences near Rim / Mid / 3PT (very heuristic).
+        def _find_pct(label_patterns):
+            for pat in label_patterns:
+                m = re.search(pat + r"[^%]{0,40}(\d{1,3}\.\d+|\d{1,3})\s*%", text, flags=re.IGNORECASE)
+                if m:
+                    return float(m.group(1)) / 100.0
+            return None
+
+        rim = _find_pct([r"At\s*Rim", r"Rim"])
+        mid = _find_pct([r"Mid\s*Range", r"Midrange", r"2\s*Pt\s*Jumper", r"Jumper"])
+        three = _find_pct([r"3\s*Pt", r"3PT", r"Three", r"Beyond\s*Arc"])
+
+        shares = [x for x in [rim, mid, three] if x is not None]
+        if len(shares) < 2:
+            return None
+
+        # If one share missing, infer as remainder if possible
+        if rim is None and mid is not None and three is not None:
+            rim = max(0.0, 1.0 - mid - three)
+        if mid is None and rim is not None and three is not None:
+            mid = max(0.0, 1.0 - rim - three)
+        if three is None and rim is not None and mid is not None:
+            three = max(0.0, 1.0 - rim - mid)
+
+        total = (rim or 0) + (mid or 0) + (three or 0)
+        if total <= 0:
+            return None
+
+        rim, mid, three = (rim or 0)/total, (mid or 0)/total, (three or 0)/total
+        return {"rim_share": rim, "mid_share": mid, "three_share": three}
+    except Exception:
+        return None
 def _build_team_profile(df_players: pd.DataFrame, minutes_override: Dict[str, float] | None = None) -> Tuple[pd.DataFrame, Dict]:
     """Compute per-possession / per-shot rates used by the simulator."""
     df = df_players.copy()
@@ -953,6 +1004,13 @@ with tabs[5]:
     with c_up2:
         opp_csv = st.file_uploader("Upload Opponent player-stats CSV (.csv)", type=["csv"], key="opp_player_csv")
 
+
+    c_pdf1, c_pdf2 = st.columns(2)
+    with c_pdf1:
+        gw_shot_pdf = st.file_uploader("Optional: Upload GW shot-chart PDF (.pdf)", type=["pdf"], key="gw_shot_pdf")
+    with c_pdf2:
+        opp_shot_pdf = st.file_uploader("Optional: Upload Opponent shot-chart PDF (.pdf)", type=["pdf"], key="opp_shot_pdf")
+
     if gw_csv is None or opp_csv is None:
         st.info("Upload both CSVs to enable simulation.")
         st.stop()
@@ -964,6 +1022,21 @@ with tabs[5]:
         st.error(f"Could not read one of the CSV files: {e}")
         st.stop()
 
+
+    # Optional shot-chart PDFs (best-effort parsing)
+    gw_shot_mix = _try_shot_mix_from_pdf(gw_shot_pdf)
+    op_shot_mix = _try_shot_mix_from_pdf(opp_shot_pdf)
+
+    if gw_shot_pdf is not None:
+        if gw_shot_mix:
+            st.success(f"GW shot-chart parsed (team mix): Rim {gw_shot_mix['rim_share']:.0%}, Mid {gw_shot_mix['mid_share']:.0%}, 3PT {gw_shot_mix['three_share']:.0%}.")
+        else:
+            st.warning("GW shot-chart PDF uploaded, but I couldn't reliably parse the shot mix from it (yet).")
+    if opp_shot_pdf is not None:
+        if op_shot_mix:
+            st.success(f"Opponent shot-chart parsed (team mix): Rim {op_shot_mix['rim_share']:.0%}, Mid {op_shot_mix['mid_share']:.0%}, 3PT {op_shot_mix['three_share']:.0%}.")
+        else:
+            st.warning("Opponent shot-chart PDF uploaded, but I couldn't reliably parse the shot mix from it (yet).")
     # Team labels
     gw_team_default = str(gw_raw["team"].iloc[0]) if "team" in gw_raw.columns and len(gw_raw) else "George Washington"
     op_team_default = str(op_raw["team"].iloc[0]) if "team" in op_raw.columns and len(op_raw) else "Opponent"
@@ -981,23 +1054,45 @@ with tabs[5]:
         op_tempo = st.number_input("Opponent AdjTempo", value=69.2, step=0.1, format="%.1f")
 
     st.markdown("### GW minutes (you control these)")
-    gw_min_df = gw_raw[["player", "mins_pg"]].copy()
-    gw_min_df["mins_pg"] = gw_min_df["mins_pg"].fillna(0.0)
-    gw_min_df = gw_min_df.sort_values("mins_pg", ascending=False).reset_index(drop=True)
+    st.caption("Use integer minute sliders. **Total must equal 200** (5 players × 40 minutes).")
 
-    # Editable minutes table
-    gw_min_edit = st.data_editor(
-        gw_min_df.rename(columns={"mins_pg": "MINUTES"}),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "player": st.column_config.TextColumn("Player", disabled=True),
-            "MINUTES": st.column_config.NumberColumn("Minutes", min_value=0.0, max_value=40.0, step=0.5),
-        },
-        key="gw_minutes_editor",
-    )
+    gw_min_base = gw_raw[["player", "mins_pg"]].copy()
+    gw_min_base["mins_pg"] = gw_min_base["mins_pg"].fillna(0.0)
+    gw_min_base = gw_min_base.sort_values("mins_pg", ascending=False).reset_index(drop=True)
 
-    minutes_override = {r["player"]: float(r["MINUTES"]) for _, r in gw_min_edit.iterrows()}
+    # Initialize slider defaults once (rounded mins_pg)
+    if "gw_minutes_override" not in st.session_state:
+        st.session_state["gw_minutes_override"] = {
+            r["player"]: int(round(float(r["mins_pg"]))) for _, r in gw_min_base.iterrows()
+        }
+
+    minutes_override: Dict[str, int] = {}
+    total_minutes = 0
+
+    # Show sliders in 2 columns for speed
+    cols = st.columns(2)
+    for i, row in gw_min_base.iterrows():
+        player = str(row["player"])
+        default_val = int(st.session_state["gw_minutes_override"].get(player, int(round(float(row["mins_pg"])))))
+        default_val = int(max(0, min(40, default_val)))
+
+        with cols[i % 2]:
+            val = st.slider(
+                player,
+                min_value=0,
+                max_value=40,
+                value=default_val,
+                step=1,
+                key=f"gw_min_{player}",
+            )
+        minutes_override[player] = int(val)
+        total_minutes += int(val)
+
+    st.markdown(f"**Total GW minutes:** `{total_minutes}` / 200")
+    minutes_ok = (total_minutes == 200)
+
+    if not minutes_ok:
+        st.error("GW minutes must sum to **200**. Adjust sliders until the total hits 200 to run simulations.")
 
     c_sims1, c_sims2 = st.columns([1, 2])
     with c_sims1:
@@ -1005,7 +1100,7 @@ with tabs[5]:
     with c_sims2:
         st.caption("Tip: 5,000–20,000 is usually plenty; 50,000 is a hard cap.")
 
-    run = st.button("Run simulations", type="primary")
+    run = st.button("Run simulations", type="primary", disabled=not minutes_ok)
 
     if not run:
         st.stop()
@@ -1013,6 +1108,12 @@ with tabs[5]:
     # Build team profiles
     gw_df, gw_team = _build_team_profile(gw_raw, minutes_override=minutes_override)
     op_df, op_team = _build_team_profile(op_raw, minutes_override=None)
+
+    # If shot-chart PDFs provided, softly blend each team's 3PA share toward the PDF-derived team value
+    if gw_shot_mix and "three_share" in gw_df.columns:
+        gw_df["three_share"] = (0.7 * gw_df["three_share"] + 0.3 * float(gw_shot_mix["three_share"])).clip(0, 1)
+    if op_shot_mix and "three_share" in op_df.columns:
+        op_df["three_share"] = (0.7 * op_df["three_share"] + 0.3 * float(op_shot_mix["three_share"])).clip(0, 1)
 
     # KenPom scaling to set expected PPP
     gw_target_eff = _expected_adj_eff(gw_adj_o, op_adj_d) / 100.0
