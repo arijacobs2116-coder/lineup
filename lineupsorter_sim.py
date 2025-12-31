@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Tuple, List
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import bcrypt
 
