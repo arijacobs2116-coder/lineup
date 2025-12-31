@@ -11,6 +11,19 @@ import pandas as pd
 import streamlit as st
 import bcrypt
 
+# ---------------------------------------------------------------------------
+# PDF parsing helper import
+# Streamlit Cloud images sometimes ship `pypdf` (new) but not `PyPDF2` (old).
+# We'll try both and gracefully degrade if neither exists.
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover
+    from pypdf import PdfReader  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except Exception:
+        PdfReader = None  # type: ignore
+
 ###############################################################################
 # Config / storage
 ###############################################################################
@@ -427,230 +440,23 @@ def _read_player_stats_csv(uploaded_file) -> pd.DataFrame:
 
     return df
 
-
-def parse_cbb_team_pdf_zones_both(uploaded_pdf) -> pd.DataFrame:
-    """
-    Parse a CBB Analytics TEAM player-profiles PDF and extract BOTH FGA% and FG%
-    by shot zone for each player (from the 'Shot Zone ... FGA% FG%' table).
-
-    Returns columns:
-      jersey, player,
-      FGA% At Rim / In Paint / Midrange 2s / Above Break 3s / Corner 3s / At Rim + 3s / Heaves
-      FG%  At Rim / In Paint / Midrange 2s / Above Break 3s / Corner 3s / At Rim + 3s / Heaves
-    """
-    from io import BytesIO
-    from PyPDF2 import PdfReader
-
-    pdf_bytes = uploaded_pdf.read()
-    reader = PdfReader(BytesIO(pdf_bytes))
-
-    rows = []
-    zones = [
-        "At Rim",
-        "In Paint",
-        "Midrange 2s",
-        "Above Break 3s",
-        "Corner 3s",
-        "At Rim + 3s",
-        "Heaves",
-    ]
-
-    for page in reader.pages:
-        try:
-            text = page.extract_text()
-        except Exception:
-            continue
-        if not text or "Shot Zone" not in text:
-            continue
-
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            continue
-
-        # Player header: "Name (#12, Guard, ... ) : Profile"
-        header_line = lines[0]
-        m = re.match(r"^(.*?)\s*\(#(\d+)", header_line)
-        if m:
-            name = m.group(1).strip()
-            jersey = m.group(2).strip()
-        else:
-            continue
-
-        # Find the shot-zone header line
-        shot_idx = None
-        for i, ln in enumerate(lines):
-            if "Shot Zone" in ln and "FGA" in ln:
-                shot_idx = i
-                break
-        if shot_idx is None:
-            continue
-
-        fga_vals = []
-        fg_vals = []
-
-        for ln in lines[shot_idx + 1 :]:
-            # Stop when we hit DNQ / summary sections
-            if (
-                ln.startswith("DNQ")
-                or "Zone % of Shots" in ln
-                or "Zone FG%" in ln
-                or "Shot Chart" in ln
-            ):
-                break
-
-            parts = ln.split()
-            if not parts:
-                continue
-
-            numeric_tokens = [t for t in parts if re.match(r"^-?\d+(\.\d+)?%?$", t)]
-            if len(numeric_tokens) < 2:
-                continue
-
-            # Last two numeric tokens are FGA% and FG%
-            fga_token = numeric_tokens[-2]
-            fg_token = numeric_tokens[-1]
-
-            try:
-                fga_vals.append(float(fga_token.replace("%", "")))
-            except Exception:
-                fga_vals.append(float("nan"))
-
-            try:
-                fg_vals.append(float(fg_token.replace("%", "")))
-            except Exception:
-                fg_vals.append(float("nan"))
-
-            if len(fga_vals) >= len(zones):
-                break
-
-        if not fga_vals:
-            continue
-
-        while len(fga_vals) < len(zones):
-            fga_vals.append(float("nan"))
-            fg_vals.append(float("nan"))
-        while len(fg_vals) < len(zones):
-            fg_vals.append(float("nan"))
-
-        row = {"jersey": jersey, "player": name}
-        for i, z in enumerate(zones):
-            row[f"FGA% {z}"] = fga_vals[i]
-            row[f"FG% {z}"] = fg_vals[i]
-        rows.append(row)
-
-    if not rows:
-        raise ValueError("No Shot Zone tables with FGA% + FG% found in PDF.")
-    return pd.DataFrame(rows)
-
-
-def _apply_shot_zone_overrides(df_team: pd.DataFrame, zones_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Use shot-diet (FGA%) + zone FG% from a CBB Analytics PDF to override
-    each player's simulated:
-      - 3PA rate (share of attempts that are 3s)
-      - 2P make probability
-      - 3P make probability
-
-    We match on jersey when possible; fallback to player name.
-    """
-    if zones_df is None or zones_df.empty:
-        return df_team
-
-    z = zones_df.copy()
-    # Normalize jersey to string digits
-    z["jersey"] = z["jersey"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-    if "jersey" in df_team.columns:
-        df_team["jersey"] = df_team["jersey"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-
-    # Core zones
-    core2 = ["At Rim", "In Paint", "Midrange 2s"]
-    core3 = ["Above Break 3s", "Corner 3s"]
-
-    for col in [f"FGA% {c}" for c in core2 + core3] + [f"FG% {c}" for c in core2 + core3]:
-        if col in z.columns:
-            z[col] = pd.to_numeric(z[col], errors="coerce")
-
-    # Join: prefer jersey, else name
-    joined = df_team.merge(z, on="jersey", how="left", suffixes=("", "_z"))
-    miss = joined["FGA% At Rim"].isna()
-    if miss.any():
-        tmp = df_team.merge(z, on="player", how="left", suffixes=("", "_z"))
-        for col in z.columns:
-            if col in ["jersey", "player"]:
-                continue
-            joined.loc[miss, col] = tmp.loc[miss, col]
-
-    # Compute shares and zone-based FG%
-    fga2 = joined[[f"FGA% {c}" for c in core2]].sum(axis=1, min_count=1)
-    fga3 = joined[[f"FGA% {c}" for c in core3]].sum(axis=1, min_count=1)
-
-    # Weighted FG% inside 2s and 3s
-    def _wavg_fg(row, zones):
-        weights = np.array([row.get(f"FGA% {zv}", np.nan) for zv in zones], dtype=float)
-        vals = np.array([row.get(f"FG% {zv}", np.nan) for zv in zones], dtype=float)
-        if np.all(np.isnan(weights)) or np.all(np.isnan(vals)):
-            return np.nan
-        weights = np.nan_to_num(weights, nan=0.0)
-        vals = np.nan_to_num(vals, nan=np.nan)
-        s = weights.sum()
-        if s <= 0:
-            return np.nan
-        # If some FG% missing, ignore those weights
-        mask = ~np.isnan(vals)
-        if not mask.any():
-            return np.nan
-        w = weights[mask]
-        v = vals[mask]
-        s2 = w.sum()
-        if s2 <= 0:
-            return np.nan
-        return float((w * v).sum() / s2)
-
-    p2_from_pdf = joined.apply(lambda r: _wavg_fg(r, core2), axis=1) / 100.0
-    p3_from_pdf = joined.apply(lambda r: _wavg_fg(r, core3), axis=1) / 100.0
-
-    # 3PA share from PDF (as % of attempts)
-    p3_rate_from_pdf = (fga3 / (fga2 + fga3)).replace([np.inf, -np.inf], np.nan)
-
-    out = df_team.copy()
-    # Blend (PDF can be noisy): 70% PDF, 30% season.
-    blend = 0.70
-
-    # p3_rate_sim exists later, but if not, update base p3_rate.
-    if "p3_rate" in out.columns:
-        base_p3r = out["p3_rate"].astype(float)
-        out["p3_rate"] = np.where(
-            ~np.isnan(p3_rate_from_pdf),
-            (blend * p3_rate_from_pdf + (1 - blend) * base_p3r).clip(0, 1),
-            base_p3r,
-        )
-
-    # Override make probs if available
-    if "p2" in out.columns:
-        out["p2"] = np.where(~np.isnan(p2_from_pdf), (blend * p2_from_pdf + (1 - blend) * out["p2"]).clip(0, 1), out["p2"])
-    if "p3" in out.columns:
-        out["p3"] = np.where(~np.isnan(p3_from_pdf), (blend * p3_from_pdf + (1 - blend) * out["p3"]).clip(0, 1), out["p3"])
-
-    return out
-
 def _build_team_profile(df_players: pd.DataFrame, minutes_override: Dict[str, float] | None = None) -> Tuple[pd.DataFrame, Dict]:
     """Compute per-possession / per-shot rates used by the simulator."""
     df = df_players.copy()
 
     # Minutes per game: override (GW) or use mins_pg (opponent)
-    if minutes_override:
-        df["mins_sim"] = df["player"].map(minutes_override).fillna(0.0)
+    if minutes_override is not None:
+        # Caller validates sum==200; we respect the chosen rotation exactly.
+        df["mins_sim"] = df["player"].map(minutes_override).fillna(0.0).clip(lower=0.0)
     else:
-        df["mins_sim"] = df["mins_pg"].fillna(0.0)
+        df["mins_sim"] = df["mins_pg"].fillna(0.0).clip(lower=0.0)
 
-    # Scale minutes so total player-minutes = 200 (40*5)
-    total_mins = df["mins_sim"].sum()
-    if total_mins <= 0:
-        df["mins_sim"] = 0.0
-        total_mins = 0.0
-    else:
-        scale = 200.0 / total_mins
-        df["mins_sim"] = df["mins_sim"] * scale
+        # Scale opponent minutes so total player-minutes = 200 (40*5)
+        total_mins = df["mins_sim"].sum()
+        if total_mins <= 0:
+            df["mins_sim"] = 0.0
+        else:
+            df["mins_sim"] = df["mins_sim"] * (200.0 / total_mins)
 
     # Possession share: combine minutes + observed poss/min to get a realistic touch/usage proxy
     df["poss_per_min"] = df["poss"] / df["mins_total"].replace(0, np.nan)
@@ -731,6 +537,182 @@ def _apply_kenpom_scaling(df_team: pd.DataFrame, target_ppp: float) -> pd.DataFr
 
     return df
 
+
+def parse_cbb_team_pdf_zones_both(uploaded_pdf) -> pd.DataFrame:
+    """Parse CBB Analytics TEAM player-profiles PDF for FGA% and FG% by zone.
+
+    Expected zones in order:
+      At Rim, In Paint, Midrange 2s, Above Break 3s, Corner 3s, At Rim + 3s, Heaves
+
+    Returns a DataFrame with columns:
+      Jersey, Player, FGA% <zone>..., FG% <zone>...
+    """
+    if PdfReader is None:
+        raise ImportError(
+            "PDF parsing requires the `pypdf` package. Add `pypdf` to requirements.txt on Streamlit Cloud."
+        )
+
+    from io import BytesIO
+
+    pdf_bytes = uploaded_pdf.read()
+    reader_local = PdfReader(BytesIO(pdf_bytes))
+
+    rows = []
+    zones = [
+        "At Rim",
+        "In Paint",
+        "Midrange 2s",
+        "Above Break 3s",
+        "Corner 3s",
+        "At Rim + 3s",
+        "Heaves",
+    ]
+
+    for page in reader_local.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            continue
+        if "Shot Zone" not in text:
+            continue
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        header_line = lines[0]
+        m = re.match(r"^(.*?)\s*\(#(\d+)", header_line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        jersey = m.group(2).strip()
+
+        shot_idx = None
+        for i, ln in enumerate(lines):
+            if "Shot Zone" in ln and "FGA" in ln:
+                shot_idx = i
+                break
+        if shot_idx is None:
+            continue
+
+        fga_vals, fg_vals = [], []
+        for ln in lines[shot_idx + 1 :]:
+            if (
+                ln.startswith("DNQ")
+                or "Zone % of Shots" in ln
+                or "Zone FG%" in ln
+                or "Shot Chart" in ln
+            ):
+                break
+
+            parts = ln.split()
+            if not parts:
+                continue
+
+            numeric_tokens = [t for t in parts if re.match(r"^-?\d+(\.\d+)?%?$", t)]
+            if len(numeric_tokens) < 2:
+                continue
+
+            fga_token = numeric_tokens[-2]
+            fg_token = numeric_tokens[-1]
+            try:
+                fga_vals.append(float(fga_token.replace("%", "")))
+            except Exception:
+                fga_vals.append(float("nan"))
+            try:
+                fg_vals.append(float(fg_token.replace("%", "")))
+            except Exception:
+                fg_vals.append(float("nan"))
+
+            if len(fga_vals) >= len(zones):
+                break
+
+        if not fga_vals:
+            continue
+
+        while len(fga_vals) < len(zones):
+            fga_vals.append(float("nan"))
+            fg_vals.append(float("nan"))
+
+        row = {"Jersey": jersey, "Player": name}
+        for i, z in enumerate(zones):
+            row[f"FGA% {z}"] = fga_vals[i]
+            row[f"FG% {z}"] = fg_vals[i]
+        rows.append(row)
+
+    if not rows:
+        raise ValueError("No Shot Zone tables with both FGA% and FG% found in PDF.")
+    return pd.DataFrame(rows)
+
+
+def _apply_shot_zone_overrides(df_players: pd.DataFrame, zones_df: pd.DataFrame) -> pd.DataFrame:
+    """Optionally override shooting mix/accuracy using CBB Analytics shot-zone tables.
+
+    We derive:
+      - three_share: (Above Break 3s + Corner 3s) / 100
+      - p3: weighted 3PT FG% from the two 3PT zones
+      - p2: weighted 2PT FG% from rim/paint/midrange
+
+    Matching tries Jersey first (if present) then player name (case-insensitive).
+    """
+    if zones_df is None or zones_df.empty:
+        return df_players
+
+    df = df_players.copy()
+    z = zones_df.copy()
+
+    # Normalize columns to numeric
+    core_zones = ["At Rim", "In Paint", "Midrange 2s", "Above Break 3s", "Corner 3s"]
+    for col in [f"FGA% {c}" for c in core_zones] + [f"FG% {c}" for c in core_zones]:
+        if col in z.columns:
+            z[col] = pd.to_numeric(z[col], errors="coerce")
+
+    # Keys for matching
+    if "jersey" in df.columns:
+        df["jersey"] = df["jersey"].astype(str).str.strip()
+    z["Jersey"] = z["Jersey"].astype(str).str.strip()
+    df["_player_key"] = df["player"].astype(str).str.strip().str.lower()
+    z["_player_key"] = z["Player"].astype(str).str.strip().str.lower()
+
+    # Merge
+    merged = None
+    if "jersey" in df.columns and df["jersey"].replace("", np.nan).notna().any():
+        merged = df.merge(z, how="left", left_on="jersey", right_on="Jersey")
+    else:
+        merged = df.merge(z, how="left", on="_player_key")
+
+    # Compute derived overrides
+    ab3 = merged.get("FGA% Above Break 3s")
+    c3 = merged.get("FGA% Corner 3s")
+    if ab3 is not None and c3 is not None:
+        three_share = (ab3.fillna(0) + c3.fillna(0)) / 100.0
+        merged["three_share"] = three_share.clip(0, 1)
+
+    # 3PT accuracy
+    fg_ab3 = merged.get("FG% Above Break 3s")
+    fg_c3 = merged.get("FG% Corner 3s")
+    if (ab3 is not None) and (c3 is not None) and (fg_ab3 is not None) and (fg_c3 is not None):
+        w3 = (ab3.fillna(0) + c3.fillna(0)).replace(0, np.nan)
+        p3 = ((ab3.fillna(0) * fg_ab3.fillna(0)) + (c3.fillna(0) * fg_c3.fillna(0))) / w3
+        merged["p3"] = (p3 / 100.0).fillna(merged["p3"]).clip(0, 1)
+
+    # 2PT accuracy
+    ar = merged.get("FGA% At Rim")
+    ip = merged.get("FGA% In Paint")
+    mr = merged.get("FGA% Midrange 2s")
+    fg_ar = merged.get("FG% At Rim")
+    fg_ip = merged.get("FG% In Paint")
+    fg_mr = merged.get("FG% Midrange 2s")
+    if all(v is not None for v in [ar, ip, mr, fg_ar, fg_ip, fg_mr]):
+        w2 = (ar.fillna(0) + ip.fillna(0) + mr.fillna(0)).replace(0, np.nan)
+        p2 = ((ar.fillna(0) * fg_ar.fillna(0)) + (ip.fillna(0) * fg_ip.fillna(0)) + (mr.fillna(0) * fg_mr.fillna(0))) / w2
+        merged["p2"] = (p2 / 100.0).fillna(merged["p2"]).clip(0, 1)
+
+    # Clean up
+    keep = df.columns.tolist()
+    out = merged[keep].copy()
+    return out
+
 def _simulate_one_game(
     gw_players: pd.DataFrame,
     opp_players: pd.DataFrame,
@@ -769,7 +751,7 @@ def _simulate_one_game(
     gw_box = blank_box(gw)
     op_box = blank_box(op)
 
-    def run_team_possessions(team_df, opp_df, team_box, orb_prob):
+    def run_team_possessions(team_df, opp_df, team_box, opp_box, orb_prob):
         pts = 0
         # precompute arrays for speed
         players = team_df["player"].to_numpy()
@@ -806,11 +788,12 @@ def _simulate_one_game(
             # Turnover?
             if rng.random() < to_rate[shooter_i]:
                 team_box[shooter]["TO"] += 1
-                # Attribute steal to opponent (team total only; optional)
+                # Attribute steal to an opponent defender ~55% of the time
                 if rng.random() < 0.55 and len(opp_df) > 0:
                     stl_i = int(rng.choice(len(opp_df), p=opp_df["stl_share"].to_numpy()))
                     stl_p = opp_df["player"].iloc[stl_i]
-                    # if this opp player exists in opponent box of the outer scope, it will be updated by caller
+                    if stl_p in opp_box:
+                        opp_box[stl_p]["STL"] += 1
                 continue
 
             # Shot type
@@ -862,6 +845,8 @@ def _simulate_one_game(
                     if rng.random() < 0.08 and len(opp_df) > 0:
                         blk_i = int(rng.choice(len(opp_df), p=opp_df["blk_share"].to_numpy()))
                         blk_p = opp_df["player"].iloc[blk_i]
+                        if blk_p in opp_box:
+                            opp_box[blk_p]["BLK"] += 1
                     # Rebound
                     if rng.random() < orb_prob:
                         r_i = pick(orb_share)
@@ -888,8 +873,8 @@ def _simulate_one_game(
 
         return pts
 
-    gw_pts = run_team_possessions(gw, op, gw_box, gw_orb_prob)
-    op_pts = run_team_possessions(op, gw, op_box, op_orb_prob)
+    gw_pts = run_team_possessions(gw, op, gw_box, op_box, gw_orb_prob)
+    op_pts = run_team_possessions(op, gw, op_box, gw_box, op_orb_prob)
 
     # Distribute defensive rebounds and PFs (minute-proportional, low-variance)
     def finalize_boxes(team_df, box, opp_missed_shots):
@@ -966,6 +951,7 @@ def _round_boxscore(avg_box: Dict[str, Dict[str, float]]) -> pd.DataFrame:
     if not dfr.empty:
         dfr = dfr.sort_values(["MIN", "PTS"], ascending=[False, False]).reset_index(drop=True)
     return dfr
+
 
 ####################
 # Tabs
@@ -1142,12 +1128,14 @@ with tabs[4]:
     }
     stat_rank_table(agg_view, "Rank defensive lineups", metric_map, poss_col="DefPoss")
 
+
+
 with tabs[5]:
     st.subheader("Game Simulation (Monte Carlo)")
 
     st.markdown(
         """Simulate a matchup using (1) per-player season stats from CSVs and (2) team-level KenPom inputs.
-- **GW minutes**: you choose minutes per player (**must sum to 200**).
+- **GW minutes**: you choose minutes per player (we auto-scale to 200 total).
 - **Opponent minutes**: derived from each player's average minutes per game in their CSV.
 - Output: **score distribution + spread** and an **average box score** (rounded realistically) across simulations."""
     )
@@ -1158,32 +1146,23 @@ with tabs[5]:
     with c_up2:
         opp_csv = st.file_uploader("Upload Opponent player-stats CSV (.csv)", type=["csv"], key="opp_player_csv")
 
+    c_pdf1, c_pdf2 = st.columns(2)
+    with c_pdf1:
+        gw_pdf = st.file_uploader(
+            "Optional: Upload GW CBB Analytics player-profiles shot-chart PDF (.pdf)",
+            type=["pdf"],
+            key="gw_shot_pdf",
+        )
+    with c_pdf2:
+        opp_pdf = st.file_uploader(
+            "Optional: Upload Opponent CBB Analytics player-profiles shot-chart PDF (.pdf)",
+            type=["pdf"],
+            key="opp_shot_pdf",
+        )
+
     if gw_csv is None or opp_csv is None:
         st.info("Upload both CSVs to enable simulation.")
         st.stop()
-
-
-    st.markdown("### Optional: shot-chart PDFs (CBB Analytics team player-profiles)")
-    pdf1, pdf2 = st.columns(2)
-    with pdf1:
-        gw_shot_pdf = st.file_uploader("Upload GW shot-chart PDF (.pdf)", type=["pdf"], key="gw_shot_pdf")
-    with pdf2:
-        opp_shot_pdf = st.file_uploader("Upload Opponent shot-chart PDF (.pdf)", type=["pdf"], key="opp_shot_pdf")
-
-    gw_zones_df = None
-    opp_zones_df = None
-    if gw_shot_pdf is not None:
-        try:
-            gw_zones_df = parse_cbb_team_pdf_zones_both(gw_shot_pdf)
-            st.success("Parsed GW shot zones from PDF.")
-        except Exception as e:
-            st.warning(f"GW shot-chart PDF uploaded, but couldn't parse shot zones: {e}")
-    if opp_shot_pdf is not None:
-        try:
-            opp_zones_df = parse_cbb_team_pdf_zones_both(opp_shot_pdf)
-            st.success("Parsed Opponent shot zones from PDF.")
-        except Exception as e:
-            st.warning(f"Opponent shot-chart PDF uploaded, but couldn't parse shot zones: {e}")
 
     try:
         gw_raw = _read_player_stats_csv(gw_csv)
@@ -1208,37 +1187,53 @@ with tabs[5]:
         gw_tempo = st.number_input("GW AdjTempo", value=71.6, step=0.1, format="%.1f")
         op_tempo = st.number_input("Opponent AdjTempo", value=69.2, step=0.1, format="%.1f")
 
-    
-    st.markdown("### GW minutes (you control these — must sum to 200)")
+    st.markdown("### GW minutes (you control these — must total **200**)" )
+    st.caption("Minutes are **integers only**. Total player-minutes must equal 200 (40 minutes * 5 players).")
+
     gw_min_df = gw_raw[["player", "mins_pg"]].copy()
     gw_min_df["mins_pg"] = gw_min_df["mins_pg"].fillna(0.0)
     gw_min_df = gw_min_df.sort_values("mins_pg", ascending=False).reset_index(drop=True)
 
-    with st.expander("Set GW minutes (integer minutes only)", expanded=True):
-        minutes_override: Dict[str, float] = {}
-        cols = st.columns(2)
-        total_minutes = 0
+    # Convenience: seed sliders from mins_pg scaled to 200
+    if "gw_minutes_seeded" not in st.session_state:
+        st.session_state["gw_minutes_seeded"] = False
+    if st.button("Auto-fill GW minutes from CSV (scaled to 200)", type="secondary") or (not st.session_state["gw_minutes_seeded"]):
+        base = gw_min_df["mins_pg"].to_numpy(dtype=float)
+        if base.sum() > 0:
+            scaled = base * (200.0 / base.sum())
+        else:
+            scaled = np.zeros_like(base)
+        # round to ints that sum to 200
+        ints = np.floor(scaled).astype(int)
+        rem = int(200 - ints.sum())
+        if rem > 0:
+            frac_order = np.argsort(-(scaled - np.floor(scaled)))
+            for i in frac_order[:rem]:
+                ints[i] += 1
+        for i, p in enumerate(gw_min_df["player"].tolist()):
+            st.session_state[f"gw_min_{p}"] = int(ints[i])
+        st.session_state["gw_minutes_seeded"] = True
 
-        for idx, row in gw_min_df.iterrows():
-            player = str(row["player"])
-            default_min = int(round(float(row["mins_pg"]))) if pd.notna(row["mins_pg"]) else 0
-            default_min = int(np.clip(default_min, 0, 40))
-
-            with cols[idx % 2]:
-                mval = st.slider(
-                    player,
+    minutes_override: Dict[str, int] = {}
+    cols = st.columns(2)
+    for i, p in enumerate(gw_min_df["player"].tolist()):
+        with cols[i % 2]:
+            minutes_override[p] = int(
+                st.slider(
+                    p,
                     min_value=0,
                     max_value=40,
-                    value=default_min,
                     step=1,
-                    key=f"gw_min_slider_{idx}",
+                    value=int(st.session_state.get(f"gw_min_{p}", 0)),
+                    key=f"gw_min_{p}",
                 )
-            minutes_override[player] = float(mval)
-            total_minutes += int(mval)
+            )
 
-        st.write(f"**Total minutes:** {total_minutes} / 200")
-        if total_minutes != 200:
-            st.error("GW minutes must sum to **exactly 200** (40 minutes × 5 players). Adjust sliders until it hits 200.")
+    total_minutes = int(sum(minutes_override.values()))
+    st.write(f"**Total GW minutes:** {total_minutes} / 200")
+    if total_minutes != 200:
+        st.error("GW minutes must sum to **exactly 200**. Adjust the sliders before running simulations.")
+        st.stop()
 
     c_sims1, c_sims2 = st.columns([1, 2])
     with c_sims1:
@@ -1251,20 +1246,26 @@ with tabs[5]:
     if not run:
         st.stop()
 
-
-    if total_minutes != 200:
-        st.error("Fix GW minutes first (must sum to 200) before running simulations.")
-        st.stop()
-
     # Build team profiles
     gw_df, gw_team = _build_team_profile(gw_raw, minutes_override=minutes_override)
     op_df, op_team = _build_team_profile(op_raw, minutes_override=None)
 
-    # Optional: shot-chart overrides (shot diet + zone FG%)
-    if gw_zones_df is not None:
-        gw_df = _apply_shot_zone_overrides(gw_df, gw_zones_df)
-    if opp_zones_df is not None:
-        op_df = _apply_shot_zone_overrides(op_df, opp_zones_df)
+    # Optional: shot-chart PDFs to refine shot mix + zone FG% (CBB Analytics player-profiles PDFs)
+    if gw_pdf is not None:
+        try:
+            gw_zones = parse_cbb_team_pdf_zones_both(gw_pdf)
+            gw_df = _apply_shot_zone_overrides(gw_df, gw_zones)
+            st.success("GW shot-chart PDF parsed: applied shot-mix + zone FG% overrides.")
+        except Exception as e:
+            st.warning(f"GW shot-chart PDF uploaded, but couldn't parse shot zones: {e}")
+
+    if opp_pdf is not None:
+        try:
+            op_zones = parse_cbb_team_pdf_zones_both(opp_pdf)
+            op_df = _apply_shot_zone_overrides(op_df, op_zones)
+            st.success("Opponent shot-chart PDF parsed: applied shot-mix + zone FG% overrides.")
+        except Exception as e:
+            st.warning(f"Opponent shot-chart PDF uploaded, but couldn't parse shot zones: {e}")
 
     # KenPom scaling to set expected PPP
     gw_target_eff = _expected_adj_eff(gw_adj_o, op_adj_d) / 100.0
