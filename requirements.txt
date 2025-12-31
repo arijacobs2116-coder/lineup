@@ -3,3 +3,4 @@ pandas
 numpy
 openpyxl
 bcrypt
+PyPDF2>=3.0.0
