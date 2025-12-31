@@ -1113,6 +1113,7 @@ def _apply_shot_zone_overrides(df_players: pd.DataFrame, zones_df: pd.DataFrame)
     if "Jersey" in z.columns:
         z["Jersey"] = z["Jersey"].astype(str).str.strip()
 
+    # Internal key for fallback name matching (never returned to caller)
     if df_player_col is not None:
         df["_player_key"] = df[df_player_col].astype(str).str.strip().str.lower()
     else:
@@ -1122,12 +1123,20 @@ def _apply_shot_zone_overrides(df_players: pd.DataFrame, zones_df: pd.DataFrame)
         z["_player_key"] = z["Player"].astype(str).str.strip().str.lower()
     else:
         z["_player_key"] = ""
-# Merge (prefer jersey if present, otherwise name key)
+    # Merge (prefer jersey if present, otherwise name key)
     merged = None
     if df_jersey_col is not None and df[df_jersey_col].replace("", np.nan).notna().any() and "Jersey" in z.columns:
         merged = df.merge(z, how="left", left_on=df_jersey_col, right_on="Jersey")
     else:
         merged = df.merge(z, how="left", left_on="_player_key", right_on="_player_key")
+
+    # If we merged on jersey, pandas will suffix duplicate _player_key columns.
+    # Ensure we have a plain _player_key column so downstream code never errors.
+    if "_player_key" not in merged.columns:
+        if "_player_key_x" in merged.columns:
+            merged["_player_key"] = merged["_player_key_x"]
+        elif "_player_key_y" in merged.columns:
+            merged["_player_key"] = merged["_player_key_y"]
 
     # Compute derived overrides
     ab3 = merged.get("FGA% Above Break 3s")
@@ -1156,8 +1165,8 @@ def _apply_shot_zone_overrides(df_players: pd.DataFrame, zones_df: pd.DataFrame)
         p2 = ((ar.fillna(0) * fg_ar.fillna(0)) + (ip.fillna(0) * fg_ip.fillna(0)) + (mr.fillna(0) * fg_mr.fillna(0))) / w2
         merged["p2"] = (p2 / 100.0).fillna(merged["p2"]).clip(0, 1)
 
-    # Clean up
-    keep = df.columns.tolist()
+    # Clean up: do not return helper key
+    keep = [c for c in df.columns.tolist() if c != "_player_key"]
     out = merged[keep].copy()
     return out
 
@@ -1661,43 +1670,63 @@ with tabs[5]:
     # -----------------------------------------------------------------------
     # KenPom per-player advanced/usage tables (paste or upload)
     # -----------------------------------------------------------------------
-    st.markdown("### KenPom player tables (optional, but recommended)")
-    st.caption("Paste the **expanded player page** table from KenPom (like the screenshot) or upload a CSV export. We'll merge FC/40, FD/40, TORate, Stl%, Blk%, FTRate, etc. into the simulation.")
+    gw_kp_df = None
+    op_kp_df = None
 
-    kp_col1, kp_col2 = st.columns(2)
-    with kp_col1:
-        gw_kp_raw = st.text_area("GW: Paste raw KenPom advanced/usage table here", value="", height=180, key="gw_kp_player_raw")
-        gw_kp_csv = st.file_uploader("Or upload a GW KenPom advanced CSV", type=["csv"], key="gw_kp_player_csv")
-        gw_kp_df = None
-        try:
-            if gw_kp_csv is not None:
-                gw_kp_df = load_and_clean_kenpom_csv(gw_kp_csv)
-            elif gw_kp_raw.strip():
-                gw_kp_df = parse_kenpom_paste(gw_kp_raw)
-        except Exception as e:
-            st.warning(f"GW KenPom parse issue: {e}")
-            gw_kp_df = None
+    with st.expander("KenPom player tables (optional, but recommended)", expanded=True):
+        st.caption(
+            "Paste the **expanded player page** table from KenPom (like the screenshot) or upload a CSV export. "
+            "We'll merge FC/40, FD/40, TORate, Stl%, Blk%, FTRate, etc. into the simulation."
+        )
 
-        if gw_kp_df is not None and not gw_kp_df.empty:
-            st.success(f"Parsed GW KenPom table: {len(gw_kp_df)} players.")
-            st.dataframe(gw_kp_df.head(12), use_container_width=True, hide_index=True)
+        kp_col1, kp_col2 = st.columns(2)
+        with kp_col1:
+            gw_kp_raw = st.text_area(
+                "GW: Paste raw KenPom advanced/usage table here",
+                value="",
+                height=180,
+                key="gw_kp_player_raw",
+            )
+            gw_kp_csv = st.file_uploader("Or upload a GW KenPom advanced CSV", type=["csv"], key="gw_kp_player_csv")
 
-    with kp_col2:
-        op_kp_raw = st.text_area("Opponent: Paste raw KenPom advanced/usage table here", value="", height=180, key="op_kp_player_raw")
-        op_kp_csv = st.file_uploader("Or upload an Opponent KenPom advanced CSV", type=["csv"], key="op_kp_player_csv")
-        op_kp_df = None
-        try:
-            if op_kp_csv is not None:
-                op_kp_df = load_and_clean_kenpom_csv(op_kp_csv)
-            elif op_kp_raw.strip():
-                op_kp_df = parse_kenpom_paste(op_kp_raw)
-        except Exception as e:
-            st.warning(f"Opponent KenPom parse issue: {e}")
-            op_kp_df = None
+            try:
+                if gw_kp_csv is not None:
+                    gw_kp_df = load_and_clean_kenpom_csv(gw_kp_csv)
+                elif gw_kp_raw.strip():
+                    gw_kp_df = parse_kenpom_paste(gw_kp_raw)
+            except Exception as e:
+                st.warning(f"GW KenPom parse issue: {e}")
+                gw_kp_df = None
 
-        if op_kp_df is not None and not op_kp_df.empty:
-            st.success(f"Parsed Opponent KenPom table: {len(op_kp_df)} players.")
-            st.dataframe(op_kp_df.head(12), use_container_width=True, hide_index=True)
+            if gw_kp_df is not None and not gw_kp_df.empty:
+                st.success(f"Parsed GW KenPom table: {len(gw_kp_df)} players.")
+                st.dataframe(gw_kp_df.head(12), use_container_width=True, hide_index=True)
+
+        with kp_col2:
+            op_kp_raw = st.text_area(
+                "Opponent: Paste raw KenPom advanced/usage table here",
+                value="",
+                height=180,
+                key="op_kp_player_raw",
+            )
+            op_kp_csv = st.file_uploader(
+                "Or upload an Opponent KenPom advanced CSV",
+                type=["csv"],
+                key="op_kp_player_csv",
+            )
+
+            try:
+                if op_kp_csv is not None:
+                    op_kp_df = load_and_clean_kenpom_csv(op_kp_csv)
+                elif op_kp_raw.strip():
+                    op_kp_df = parse_kenpom_paste(op_kp_raw)
+            except Exception as e:
+                st.warning(f"Opponent KenPom parse issue: {e}")
+                op_kp_df = None
+
+            if op_kp_df is not None and not op_kp_df.empty:
+                st.success(f"Parsed Opponent KenPom table: {len(op_kp_df)} players.")
+                st.dataframe(op_kp_df.head(12), use_container_width=True, hide_index=True)
 
     if gw_csv is None or opp_csv is None:
         st.info("Upload both CSVs to enable simulation.")
