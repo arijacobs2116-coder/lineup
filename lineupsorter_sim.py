@@ -667,19 +667,31 @@ def _apply_shot_zone_overrides(df_players: pd.DataFrame, zones_df: pd.DataFrame)
         if col in z.columns:
             z[col] = pd.to_numeric(z[col], errors="coerce")
 
-    # Keys for matching
-    if "jersey" in df.columns:
-        df["jersey"] = df["jersey"].astype(str).str.strip()
-    z["Jersey"] = z["Jersey"].astype(str).str.strip()
-    df["_player_key"] = df["player"].astype(str).str.strip().str.lower()
-    z["_player_key"] = z["Player"].astype(str).str.strip().str.lower()
+    # Keys for matching (robust to different column names)
+    # Identify likely player/jersey columns
+    df_player_col = "player" if "player" in df.columns else ("Player" if "Player" in df.columns else None)
+    df_jersey_col = "jersey" if "jersey" in df.columns else ("Jersey" if "Jersey" in df.columns else None)
 
-    # Merge
-    merged = None
-    if "jersey" in df.columns and df["jersey"].replace("", np.nan).notna().any():
-        merged = df.merge(z, how="left", left_on="jersey", right_on="Jersey")
+    if df_jersey_col is not None:
+        df[df_jersey_col] = df[df_jersey_col].astype(str).str.strip()
+    if "Jersey" in z.columns:
+        z["Jersey"] = z["Jersey"].astype(str).str.strip()
+
+    if df_player_col is not None:
+        df["_player_key"] = df[df_player_col].astype(str).str.strip().str.lower()
     else:
-        merged = df.merge(z, how="left", on="_player_key")
+        df["_player_key"] = ""
+
+    if "Player" in z.columns:
+        z["_player_key"] = z["Player"].astype(str).str.strip().str.lower()
+    else:
+        z["_player_key"] = ""
+# Merge (prefer jersey if present, otherwise name key)
+    merged = None
+    if df_jersey_col is not None and df[df_jersey_col].replace("", np.nan).notna().any() and "Jersey" in z.columns:
+        merged = df.merge(z, how="left", left_on=df_jersey_col, right_on="Jersey")
+    else:
+        merged = df.merge(z, how="left", left_on="_player_key", right_on="_player_key")
 
     # Compute derived overrides
     ab3 = merged.get("FGA% Above Break 3s")
@@ -781,26 +793,52 @@ def _simulate_one_game(
             probs = probs / s
             return int(rng.choice(len(players), p=probs))
 
+        
+        # Team-level context for steal/block rates
+        opp_stl_per_pos = float(opp_df["stl"].sum() / opp_df["poss"].sum()) if (len(opp_df) and opp_df["poss"].sum() > 0) else 0.08
+        opp_blk_per_pos = float(opp_df["blk"].sum() / opp_df["poss"].sum()) if (len(opp_df) and opp_df["poss"].sum() > 0) else 0.05
+
+        # Expected 2PA per possession for this team (for mapping blocks onto 2PA)
+        exp_fga_per_pos = float(np.sum(poss_share * fga_rate))
+        exp_two_pa_per_pos = float(np.sum(poss_share * fga_rate * (1 - three_share)))
+        exp_tov_per_pos = float(np.sum(poss_share * to_rate))
+
+        # Probability a turnover is credited as a steal (bounded)
+        p_steal_given_tov = float(np.clip(opp_stl_per_pos / max(exp_tov_per_pos, 1e-6), 0.35, 0.85))
+
+        # Probability a 2PA is blocked (bounded)
+        p_block_given_2pa = float(np.clip(opp_blk_per_pos / max(exp_two_pa_per_pos, 1e-6), 0.03, 0.18))
+
         for _ in range(poss):
             shooter_i = int(rng.choice(len(players), p=poss_share))
             shooter = players[shooter_i]
 
-            # Turnover?
+            had_shot = False  # used to decide whether to award FTs
+            main_shot_is_three = False
+
+            # Turnover ends the possession: NO shot, NO FTs.
             if rng.random() < to_rate[shooter_i]:
                 team_box[shooter]["TO"] += 1
-                # Attribute steal to an opponent defender ~55% of the time
-                if rng.random() < 0.55 and len(opp_df) > 0:
-                    stl_i = int(rng.choice(len(opp_df), p=opp_df["stl_share"].to_numpy()))
+
+                # Steal attribution: choose a defender weighted by opponent steal share
+                if len(opp_df) > 0 and rng.random() < p_steal_given_tov:
+                    stl_probs = opp_df["stl_share"].to_numpy() if "stl_share" in opp_df.columns else None
+                    if stl_probs is not None and stl_probs.sum() > 0:
+                        stl_i = int(rng.choice(len(opp_df), p=stl_probs))
+                    else:
+                        stl_i = int(rng.integers(len(opp_df)))
                     stl_p = opp_df["player"].iloc[stl_i]
                     if stl_p in opp_box:
                         opp_box[stl_p]["STL"] += 1
-                continue
+                continue  # possession over
 
-            # Shot type
-            is_three = rng.random() < three_share[shooter_i]
-            if is_three:
-                team_box[shooter]["3PA"] += 1
+            # Decide shot type: 3PA vs 2PA
+            main_shot_is_three = (rng.random() < three_share[shooter_i])
+
+            if main_shot_is_three:
+                had_shot = True
                 team_box[shooter]["FGA"] += 1
+                team_box[shooter]["3PA"] += 1
                 made = rng.random() < p3[shooter_i]
                 if made:
                     team_box[shooter]["3PM"] += 1
@@ -812,27 +850,44 @@ def _simulate_one_game(
                         a_i = pick(ast_share, exclude=shooter_i)
                         team_box[players[a_i]]["AST"] += 1
                 else:
-                    # Rebound
+                    # Offensive rebound chance
                     if rng.random() < orb_prob:
                         r_i = pick(orb_share)
-                        team_box[players[r_i]]["OREB"] += 1
-                        team_box[players[r_i]]["REB"] += 1
-                        # One quick second-chance 2PT
-                        team_box[players[r_i]]["FGA"] += 1
-                        made2 = rng.random() < p2[r_i]
+                        rebounder = players[r_i]
+                        team_box[rebounder]["OREB"] += 1
+                        team_box[rebounder]["REB"] += 1
+                        # Putback 2PA (quick)
+                        team_box[rebounder]["FGA"] += 1
+                        made2 = rng.random() < min(0.75, p2[r_i] + 0.08)
                         if made2:
-                            team_box[players[r_i]]["FGM"] += 1
-                            team_box[players[r_i]]["PTS"] += 2
+                            team_box[rebounder]["FGM"] += 1
+                            team_box[rebounder]["PTS"] += 2
                             pts += 2
                             if rng.random() < 0.52 and len(players) > 1:
                                 a_i = pick(ast_share, exclude=r_i)
                                 team_box[players[a_i]]["AST"] += 1
-                        else:
-                            # Defensive rebound credited later via shares (simple)
-                            pass
+                # FTs on 3PA are rare; we keep it simple: no FTs on 3s here.
+
             else:
+                had_shot = True
                 team_box[shooter]["FGA"] += 1
-                made = rng.random() < p2[shooter_i]
+
+                # Block check on 2PA (uses opponent block environment)
+                was_blocked = (len(opp_df) > 0 and rng.random() < p_block_given_2pa)
+                if was_blocked:
+                    # Attribute block to an opponent defender weighted by block share
+                    blk_probs = opp_df["blk_share"].to_numpy() if "blk_share" in opp_df.columns else None
+                    if blk_probs is not None and blk_probs.sum() > 0:
+                        blk_i = int(rng.choice(len(opp_df), p=blk_probs))
+                    else:
+                        blk_i = int(rng.integers(len(opp_df)))
+                    blk_p = opp_df["player"].iloc[blk_i]
+                    if blk_p in opp_box:
+                        opp_box[blk_p]["BLK"] += 1
+                    made = False
+                else:
+                    made = rng.random() < p2[shooter_i]
+
                 if made:
                     team_box[shooter]["FGM"] += 1
                     team_box[shooter]["PTS"] += 2
@@ -841,37 +896,36 @@ def _simulate_one_game(
                         a_i = pick(ast_share, exclude=shooter_i)
                         team_box[players[a_i]]["AST"] += 1
                 else:
-                    # Block sometimes
-                    if rng.random() < 0.08 and len(opp_df) > 0:
-                        blk_i = int(rng.choice(len(opp_df), p=opp_df["blk_share"].to_numpy()))
-                        blk_p = opp_df["player"].iloc[blk_i]
-                        if blk_p in opp_box:
-                            opp_box[blk_p]["BLK"] += 1
-                    # Rebound
+                    # Offensive rebound chance
                     if rng.random() < orb_prob:
                         r_i = pick(orb_share)
-                        team_box[players[r_i]]["OREB"] += 1
-                        team_box[players[r_i]]["REB"] += 1
-                        # Putback
-                        team_box[players[r_i]]["FGA"] += 1
+                        rebounder = players[r_i]
+                        team_box[rebounder]["OREB"] += 1
+                        team_box[rebounder]["REB"] += 1
+                        # Putback 2PA
+                        team_box[rebounder]["FGA"] += 1
                         made2 = rng.random() < min(0.75, p2[r_i] + 0.1)
                         if made2:
-                            team_box[players[r_i]]["FGM"] += 1
-                            team_box[players[r_i]]["PTS"] += 2
+                            team_box[rebounder]["FGM"] += 1
+                            team_box[rebounder]["PTS"] += 2
                             pts += 2
+                            if rng.random() < 0.52 and len(players) > 1:
+                                a_i = pick(ast_share, exclude=r_i)
+                                team_box[players[a_i]]["AST"] += 1
 
-            # Free throws off the main shot (rough)
-            lam = fta_per_fga[shooter_i]
-            if lam > 0 and rng.random() < 0.55:
-                nfta = int(min(3, rng.poisson(lam)))
-                if nfta > 0:
-                    team_box[shooter]["FTA"] += nfta
-                    ftm = int(rng.binomial(nfta, pft[shooter_i]))
-                    team_box[shooter]["FTM"] += ftm
-                    team_box[shooter]["PTS"] += ftm
-                    pts += ftm
+                # Free throws off the main 2PA (rough, but only if a shot happened)
+                lam = fta_per_fga[shooter_i]
+                if lam > 0 and rng.random() < 0.55:
+                    nfta = int(min(3, rng.poisson(lam)))
+                    if nfta > 0:
+                        team_box[shooter]["FTA"] += nfta
+                        ftm = int(rng.binomial(nfta, pft[shooter_i]))
+                        team_box[shooter]["FTM"] += ftm
+                        team_box[shooter]["PTS"] += ftm
+                        pts += ftm
 
         return pts
+
 
     gw_pts = run_team_possessions(gw, op, gw_box, op_box, gw_orb_prob)
     op_pts = run_team_possessions(op, gw, op_box, gw_box, op_orb_prob)
@@ -1175,17 +1229,45 @@ with tabs[5]:
     gw_team_default = str(gw_raw["team"].iloc[0]) if "team" in gw_raw.columns and len(gw_raw) else "George Washington"
     op_team_default = str(op_raw["team"].iloc[0]) if "team" in op_raw.columns and len(op_raw) else "Opponent"
 
-    st.markdown("### KenPom team inputs")
+    
+    # Optional: paste KenPom team table text to auto-fill AdjO/AdjD/AdjT
+    with st.expander("Paste KenPom team table (optional)", expanded=False):
+        st.caption("Paste the KenPom team summary text (e.g., lines containing 'Adj. Efficiency' and 'Adj. Tempo'). We'll try to extract AdjO, AdjD, and AdjT.")
+        gw_kp_text = st.text_area("GW KenPom paste", value="", height=120, key="gw_kp_text")
+        op_kp_text = st.text_area("Opponent KenPom paste", value="", height=120, key="op_kp_text")
+
+        def _parse_kenpom_team_text(txt: str):
+            if not txt:
+                return {}
+            # normalize
+            t = txt.replace("\t", " ").replace("  ", " ")
+            # Try to find numbers on lines
+            adj_eff = re.search(r"Adj\.?\s*Efficiency\s*([0-9]+\.?[0-9]*)\s*([0-9]+\.?[0-9]*)", t, flags=re.I)
+            adj_tempo = re.search(r"Adj\.?\s*Tempo\s*([0-9]+\.?[0-9]*)", t, flags=re.I)
+            out = {}
+            if adj_eff:
+                out["AdjO"] = float(adj_eff.group(1))
+                out["AdjD"] = float(adj_eff.group(2))
+            if adj_tempo:
+                out["AdjT"] = float(adj_tempo.group(1))
+            return out
+
+        if st.button("Extract KenPom numbers", use_container_width=True):
+            st.session_state.setdefault("kp_fill", {})
+            st.session_state["kp_fill"]["gw"] = _parse_kenpom_team_text(gw_kp_text)
+            st.session_state["kp_fill"]["op"] = _parse_kenpom_team_text(op_kp_text)
+            st.success("Parsed (if possible). Values will populate below when available.")
+st.markdown("### KenPom team inputs")
     kp1, kp2, kp3 = st.columns(3)
     with kp1:
-        gw_adj_o = st.number_input("GW AdjO", value=118.2, step=0.1, format="%.1f")
-        op_adj_o = st.number_input("Opponent AdjO", value=110.0, step=0.1, format="%.1f")
+        gw_adj_o = st.number_input("GW AdjO", value=float(st.session_state.get("kp_fill",{}).get("gw",{}).get("AdjO",118.2)), step=0.1, format="%.1f")
+        op_adj_o = st.number_input("Opponent AdjO", value=float(st.session_state.get("kp_fill",{}).get("op",{}).get("AdjO",110.0)), step=0.1, format="%.1f")
     with kp2:
-        gw_adj_d = st.number_input("GW AdjD", value=107.7, step=0.1, format="%.1f")
-        op_adj_d = st.number_input("Opponent AdjD", value=107.7, step=0.1, format="%.1f")
+        gw_adj_d = st.number_input("GW AdjD", value=float(st.session_state.get("kp_fill",{}).get("gw",{}).get("AdjD",107.7)), step=0.1, format="%.1f")
+        op_adj_d = st.number_input("Opponent AdjD", value=float(st.session_state.get("kp_fill",{}).get("op",{}).get("AdjD",107.7)), step=0.1, format="%.1f")
     with kp3:
-        gw_tempo = st.number_input("GW AdjTempo", value=71.6, step=0.1, format="%.1f")
-        op_tempo = st.number_input("Opponent AdjTempo", value=69.2, step=0.1, format="%.1f")
+        gw_tempo = st.number_input("GW AdjTempo", value=float(st.session_state.get("kp_fill",{}).get("gw",{}).get("AdjT",71.6)), step=0.1, format="%.1f")
+        op_tempo = st.number_input("Opponent AdjTempo", value=float(st.session_state.get("kp_fill",{}).get("op",{}).get("AdjT",69.2)), step=0.1, format="%.1f")
 
     st.markdown("### GW minutes (you control these — must total **200**)" )
     st.caption("Minutes are **integers only**. Total player-minutes must equal 200 (40 minutes * 5 players).")
@@ -1233,6 +1315,7 @@ with tabs[5]:
     st.write(f"**Total GW minutes:** {total_minutes} / 200")
     if total_minutes != 200:
         st.error("GW minutes must sum to **exactly 200**. Adjust the sliders before running simulations.")
+        st.stop()
         st.stop()
 
     c_sims1, c_sims2 = st.columns([1, 2])
