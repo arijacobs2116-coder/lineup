@@ -440,6 +440,60 @@ def _read_player_stats_csv(uploaded_file) -> pd.DataFrame:
 
     return df
 
+
+def _merge_kenpom_player_table(raw_df: pd.DataFrame, kp_df: pd.DataFrame) -> pd.DataFrame:
+    """Left-join KenPom per-player table onto the raw player CSV frame.
+
+    Priority match:
+      1) Jersey number if present in both
+      2) Cleaned player name
+
+    Adds KenPom columns with a `kp_` prefix.
+    """
+    if kp_df is None or kp_df.empty:
+        return raw_df
+
+    df = raw_df.copy()
+
+    # Clean keys
+    if "jersey" in df.columns:
+        df["_kp_jersey"] = df["jersey"].apply(clean_jersey)
+    else:
+        df["_kp_jersey"] = ""
+
+    df["_kp_name"] = df["player"].astype(str).apply(clean_player_name).str.lower().str.replace(r"[^a-z\s]", "", regex=True).str.strip()
+
+    kp = kp_df.copy()
+    kp["_kp_jersey"] = kp["Jersey"].apply(clean_jersey)
+    kp["_kp_name"] = kp["Player"].astype(str).apply(clean_player_name).str.lower().str.replace(r"[^a-z\s]", "", regex=True).str.strip()
+
+    # First attempt: jersey match (only for rows where jersey is non-empty)
+    out = df.merge(
+        kp.drop(columns=["Jersey", "Player"], errors="ignore").add_prefix("kp_").assign(_kp_jersey=kp["_kp_jersey"]),
+        on="_kp_jersey",
+        how="left",
+    )
+
+    # For unmatched, try name match (fill only kp_* that are still NaN)
+    kp_payload = kp.drop(columns=["Jersey", "Player"], errors="ignore").add_prefix("kp_").assign(_kp_name=kp["_kp_name"])
+    out2 = out.merge(kp_payload, on="_kp_name", how="left", suffixes=("", "_name"))
+
+    # Fill NaNs from name-join columns
+    for c in kp_payload.columns:
+        if c == "_kp_name":
+            continue
+        name_c = f"{c}_name"
+        if name_c in out2.columns:
+            if c in out2.columns:
+                out2[c] = out2[c].where(out2[c].notna(), out2[name_c])
+            else:
+                out2[c] = out2[name_c]
+            out2 = out2.drop(columns=[name_c])
+
+    # Clean temp keys
+    out2 = out2.drop(columns=[c for c in ["_kp_jersey", "_kp_name"] if c in out2.columns], errors="ignore")
+    return out2
+
 def _build_team_profile(df_players: pd.DataFrame, minutes_override: Dict[str, float] | None = None) -> Tuple[pd.DataFrame, Dict]:
     """Compute per-possession / per-shot rates used by the simulator."""
     df = df_players.copy()
@@ -470,6 +524,10 @@ def _build_team_profile(df_players: pd.DataFrame, minutes_override: Dict[str, fl
 
     # Player-level probabilities/rates
     df["to_rate"] = (df["tov"] / df["poss"].replace(0, np.nan)).fillna(0.0).clip(0, 1)
+    # If KenPom TORate (% of possessions) exists, blend it in (helps when CSV is noisy)
+    if "kp_TORate" in df.columns and df["kp_TORate"].notna().any():
+        kp_to = (pd.to_numeric(df["kp_TORate"], errors="coerce") / 100.0).clip(0, 1)
+        df["to_rate"] = (0.6 * df["to_rate"] + 0.4 * kp_to).fillna(df["to_rate"]).clip(0, 1)
     df["fga_rate"] = (df["fga"] / df["poss"].replace(0, np.nan)).fillna(0.0).clip(0, 3)  # can exceed 1 w/ ORBs; that's ok
     df["three_share"] = (df["fga3"] / df["fga"].replace(0, np.nan)).fillna(0.0).clip(0, 1)
 
@@ -479,6 +537,13 @@ def _build_team_profile(df_players: pd.DataFrame, minutes_override: Dict[str, fl
 
     # Approximate FT attempts per FGA (shot-based free throws; caps keep it sane)
     df["fta_per_fga"] = (df["fta"] / df["fga"].replace(0, np.nan)).fillna(0.0).clip(0, 2)
+    # If KenPom FTRate exists (KenPom reports it like 44.6 meaning 0.446), prefer it
+    if "kp_FTRate" in df.columns and df["kp_FTRate"].notna().any():
+        kp_ftr = (pd.to_numeric(df["kp_FTRate"], errors="coerce") / 100.0).clip(0, 2)
+        df["fta_per_fga"] = df["fta_per_fga"].where(kp_ftr.isna(), kp_ftr).fillna(df["fta_per_fga"])
+    # If KenPom FT% exists (parsed as decimal like .683), use it for pft
+    if "kp_FT%" in df.columns and df["kp_FT%"].notna().any():
+        df["pft"] = df["pft"].where(df["kp_FT%"].isna(), pd.to_numeric(df["kp_FT%"], errors="coerce")).clip(0, 1).fillna(df["pft"])
 
     # Shares for distributing secondary stats
     def _share(col: str) -> pd.Series:
@@ -491,6 +556,14 @@ def _build_team_profile(df_players: pd.DataFrame, minutes_override: Dict[str, fl
     df["reb_share"] = _share("reb")
     df["stl_share"] = _share("stl")
     df["blk_share"] = _share("blk")
+
+    # If KenPom Stl% / Blk% exist, use them as distribution weights (more stable than raw counts)
+    if "kp_Stl%" in df.columns and df["kp_Stl%"].notna().any():
+        w = pd.to_numeric(df["kp_Stl%"], errors="coerce").clip(lower=0)
+        df["stl_share"] = (w / w.sum()) if w.sum() > 0 else df["stl_share"]
+    if "kp_Blk%" in df.columns and df["kp_Blk%"].notna().any():
+        w = pd.to_numeric(df["kp_Blk%"], errors="coerce").clip(lower=0)
+        df["blk_share"] = (w / w.sum()) if w.sum() > 0 else df["blk_share"]
 
     # Team-level aggregates
     team = {
@@ -535,6 +608,369 @@ def _apply_kenpom_scaling(df_team: pd.DataFrame, target_ppp: float) -> pd.DataFr
     df["pft_sim"] = (df["pft"] * make_scale).clip(0, 1)
     df["to_rate_sim"] = (df["to_rate"] * tov_scale).clip(0, 1)
 
+    return df
+
+
+
+
+# ---------------------------------------------------------------------------
+# KenPom player advanced/usage table parsing (paste or CSV)
+# ---------------------------------------------------------------------------
+def clean_player_name(name: str) -> str:
+    """
+    Cleans KenPom names by removing junk like 'National Rank' etc.
+    """
+    if not isinstance(name, str):
+        name = str(name)
+
+    s = name.replace("\n", " ")
+    # Remove 'National Rank...' (case-insensitive, optional spaces)
+    s = re.sub(r"(?i)national\s*rank.*$", "", s)
+    # Remove trailing digits like '1' in 'Boozer1'
+    s = re.sub(r"\d+$", "", s)
+    # Collapse whitespace
+    s = " ".join(s.split())
+    return s.strip()
+
+
+def clean_jersey(j):
+    """
+    Convert jersey values like '1', '01', '1.0', '1.00', ' 1.0' → '1'.
+    If it's not numeric, return stripped string.
+    """
+    try:
+        return str(int(float(str(j).strip())))
+    except Exception:
+        return str(j).strip()
+
+
+def _final_clean_kenpom_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Shared final cleaning logic for KenPom advanced stats DataFrame.
+    Assumes df already has 'Jersey' and 'Player' columns populated.
+    """
+    # Remove category header rows (blank jerseys)
+    df = df[df["Jersey"].notna() & (df["Jersey"].str.len() > 0)].copy()
+
+    # Clean jersey formatting
+    df["Jersey"] = (
+        df["Jersey"]
+        .astype(str)
+        .str.replace(".0", "", regex=False)
+        .str.strip()
+    )
+
+    # Clean player names (remove National Rank junk)
+    df["Player"] = df["Player"].apply(clean_player_name)
+
+    allowed_columns = [
+        "Jersey",
+        "Player",
+        "ORtg",
+        "%Poss",
+        "%Shots",
+        "eFG%",
+        "TS%",
+        "OR%",
+        "DR%",
+        "ARate",
+        "TORate",
+        "Blk%",
+        "Stl%",
+        "FC/40",
+        "FD/40",
+        "FTRate",
+    ]
+
+    df = df[[c for c in df.columns if c in allowed_columns]].copy()
+
+    numeric_cols = [c for c in df.columns if c not in ["Jersey", "Player"]]
+
+    for col in numeric_cols:
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Truncate to 1 decimal place (KenPom style)
+        df[col] = df[col].apply(
+            lambda x: float(int(x * 10)) / 10 if pd.notna(x) else x
+        )
+
+    return df
+
+
+def load_and_clean_kenpom_csv(uploaded_file):
+    """
+    Fallback: Loads a KenPom-style advanced stats CSV:
+      - First two columns are Unnamed: 0 (jersey), Unnamed: 1 (name), etc.
+    """
+    df = pd.read_csv(uploaded_file)
+
+    # Clean whitespace from headers
+    df.columns = [c.strip() for c in df.columns]
+
+    # Jersey + player
+    if "Unnamed: 0" in df.columns and "Unnamed: 1" in df.columns:
+        df["Jersey"] = df["Unnamed: 0"].astype(str).str.strip()
+        df["Player"] = df["Unnamed: 1"].astype(str).str.strip()
+        df = df.drop(columns=["Unnamed: 0", "Unnamed: 1"])
+    else:
+        # Fallback if headers were renamed
+        jersey_col = None
+        player_col = None
+        for c in df.columns:
+            lc = c.lower()
+            if "jersey" in lc or lc in ("#", "no", "number"):
+                jersey_col = c
+            if "player" in lc or "name" in lc:
+                player_col = c
+
+        if jersey_col is None or player_col is None:
+            raise ValueError("Could not find jersey/name columns in advanced stats CSV.")
+
+        df["Jersey"] = df[jersey_col].astype(str).str.strip()
+        df["Player"] = df[player_col].astype(str).str.strip()
+
+    df = _final_clean_kenpom_df(df)
+    return df
+
+
+def extract_numbers(line: str):
+    """Return list of floatable numbers found in a line."""
+    nums = re.findall(r"[-+]?\d*\.?\d+", line)
+    out = []
+    for n in nums:
+        try:
+            out.append(float(n))
+        except ValueError:
+            continue
+    return out
+
+
+def parse_kenpom_paste(raw: str) -> pd.DataFrame:
+    """
+    Parse raw text copied directly from a KenPom player-usage/advanced page.
+
+    Handles:
+      - Header row (Ht Wt Yr G S ...)
+      - Usage category headers (Go-to guys, etc.)
+      - 'National Rank' lines
+      - Line breaks and rank numbers between stats
+
+    Returns a DataFrame with one row per player.
+    """
+    import re
+
+    # ---------- 1) CLEAN LINES ----------
+    lines = [ln.rstrip() for ln in raw.splitlines()]
+    lines = [ln for ln in lines if ln.strip()]
+
+    cleaned = []
+    for ln in lines:
+        s = ln.strip()
+
+        # Top header row
+        if s.startswith("Ht") and "Wt" in s and "Yr" in s:
+            continue
+
+        # Usage category headers
+        if "possessions used" in s.lower():
+            continue
+
+        cleaned.append(ln)
+
+    lines = cleaned
+
+    # ---------- 2) FIND PLAYER BLOCK STARTS ----------
+    # A player block starts with: "2 Jahvin Carter", "55 Sean Smith", etc.
+    player_starts = [
+        idx for idx, line in enumerate(lines)
+        if re.match(r"^\s*\d+\s+[A-Za-z]", line)
+    ]
+
+    if not player_starts:
+        raise ValueError("Could not find any player lines in the pasted KenPom text.")
+
+    def parse_player_block(block_lines: list[str]) -> dict | None:
+        # Flatten block so we don't care about original line breaks
+        text = " ".join(block_lines)
+        tokens = text.split()
+        if not tokens:
+            return None
+
+        # ---- Remove the literal "National Rank" phrase + its tokens ----
+        filtered = []
+        i = 0
+        while i < len(tokens):
+            if (
+                tokens[i].lower() == "national"
+                and i + 1 < len(tokens)
+                and tokens[i + 1].lower() == "rank"
+            ):
+                i += 2
+                continue
+            filtered.append(tokens[i])
+            i += 1
+        tokens = filtered
+
+        # Jersey
+        if not tokens[0].isdigit():
+            return None
+        jersey = tokens[0]
+
+        # ---- Name runs from after jersey up until the height token (like "6-3") ----
+        name_tokens = []
+        height_idx = None
+        for i in range(1, len(tokens)):
+            if re.match(r"^\d+-\d+$", tokens[i]):  # 6-3, 6-11, etc.
+                height_idx = i
+                break
+            name_tokens.append(tokens[i])
+
+        if height_idx is None or not name_tokens:
+            return None
+
+        name = " ".join(name_tokens)
+
+        # ---- Basic info: height, weight, year, games, starts (optional) ----
+        def safe_get(idx: int, default: str = "") -> str:
+            return tokens[idx] if idx < len(tokens) else default
+
+        ht = safe_get(height_idx)
+        wt = safe_get(height_idx + 1)
+        yr = safe_get(height_idx + 2)
+
+        j = height_idx + 3
+        g = safe_get(j)
+        j += 1
+
+        # S (starts) is optional – if next token has a '.', it's actually %Min
+        s = ""
+        if j < len(tokens) and "." not in tokens[j]:
+            s = tokens[j]
+            j += 1
+
+        # %Min (always decimal)
+        pct_min = float(tokens[j])
+        j += 1
+
+        # ---- Helper: read next stat, skipping integer rank tokens ----
+        def next_stat(idx: int):
+            # Only accept tokens with '.' (all KenPom advanced stats use a decimal)
+            while idx < len(tokens) and "." not in tokens[idx]:
+                idx += 1
+            if idx >= len(tokens):
+                return None, idx
+            v = float(tokens[idx])
+            idx += 1
+            return v, idx
+
+        # ORtg after %Min (possibly with rank in between)
+        ortg, j = next_stat(j)
+
+        # Remaining advanced stats in order:
+        stat_keys = [
+            "%Poss",
+            "%Shots",
+            "eFG%",
+            "TS%",
+            "OR%",
+            "DR%",
+            "ARate",
+            "TORate",
+            "Blk%",
+            "Stl%",
+            "FC/40",
+            "FD/40",
+            "FTRate",
+        ]
+
+        stats: dict[str, float | None] = {}
+        for key in stat_keys:
+            stats[key], j = next_stat(j)
+
+        # ---- Parse FT / 2P / 3P splits from the END ----
+        def parse_splits(tokens: list[str]):
+            ftma = ftpct = twoma = twopct = threema = threepct = None
+            idx = len(tokens) - 1
+
+            def prev_pct(k: int):
+                # Move left until token contains '.' (".750", ".500", ".333", etc.)
+                while k >= 0 and "." not in tokens[k]:
+                    k -= 1
+                if k < 0:
+                    return None, k
+                try:
+                    v = float(tokens[k])
+                except ValueError:
+                    v = None
+                return v, k - 1
+
+            def prev_ma(k: int):
+                while k >= 0:
+                    if re.match(r"^\d+-\d+$", tokens[k]):  # like 9-12, 4-8
+                        return tokens[k], k - 1
+                    k -= 1
+                return None, k
+
+            threepct, idx = prev_pct(idx)
+            threema, idx = prev_ma(idx)
+            twopct, idx = prev_pct(idx)
+            twoma, idx = prev_ma(idx)
+            ftpct, idx = prev_pct(idx)
+            ftma, idx = prev_ma(idx)
+
+            return ftma, ftpct, twoma, twopct, threema, threepct
+
+        ftma, ftpct, twoma, twopct, threema, threepct = parse_splits(tokens)
+
+        row = {
+            "Jersey": jersey,
+            "Player": name,
+            "Ht": ht,
+            "Wt": wt,
+            "Yr": yr,
+            "G": g,
+            "S": s,
+            "%Min": pct_min,
+            "ORtg": ortg,
+            "%Poss": stats["%Poss"],
+            "%Shots": stats["%Shots"],
+            "eFG%": stats["eFG%"],
+            "TS%": stats["TS%"],
+            "OR%": stats["OR%"],
+            "DR%": stats["DR%"],
+            "ARate": stats["ARate"],
+            "TORate": stats["TORate"],
+            "Blk%": stats["Blk%"],
+            "Stl%": stats["Stl%"],
+            "FC/40": stats["FC/40"],
+            "FD/40": stats["FD/40"],
+            "FTRate": stats["FTRate"],
+            "FTM-A": ftma,
+            "FT%": ftpct,
+            "2PM-A": twoma,
+            "2P%": twopct,
+            "3PM-A": threema,
+            "3P%": threepct,
+        }
+        return row
+
+    # ---------- 3) BUILD DATAFRAME ----------
+    players: list[dict] = []
+    for idx, start_idx in enumerate(player_starts):
+        end_idx = player_starts[idx + 1] if idx + 1 < len(player_starts) else len(lines)
+        block = lines[start_idx:end_idx]
+        row = parse_player_block(block)
+        if row is not None:
+            players.append(row)
+
+    df = pd.DataFrame(players)
     return df
 
 
@@ -774,6 +1210,7 @@ def _simulate_one_game(
         p3 = team_df["p3_sim"].to_numpy()
         pft = team_df["pft_sim"].to_numpy()
         fta_per_fga = team_df["fta_per_fga"].to_numpy()
+        fga_rate = team_df["fga_rate"].to_numpy()
         ast_share = team_df["ast_share"].to_numpy()
         orb_share = team_df["orb_share"].to_numpy()
         drb_share = team_df["drb_share"].to_numpy()
@@ -947,10 +1384,16 @@ def _simulate_one_game(
             box[p]["DREB"] += drb_i
             box[p]["REB"] += drb_i
 
-        # PF: use observed pf/min and simulated minutes
-        pf_per_min = float(team_df["pf"].sum() / team_df["mins_total"].sum()) if team_df["mins_total"].sum() > 0 else 0.12
-        for p, m in zip(team_df["player"], team_df["mins_sim"]):
-            box[p]["PF"] = float(rng.poisson(max(0.0, pf_per_min * m)))
+        # PF: prefer KenPom FC/40 if present, else fallback to season PF/min
+        if "kp_FC/40" in team_df.columns and team_df["kp_FC/40"].notna().any():
+            fc40 = pd.to_numeric(team_df["kp_FC/40"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            for p, m, r in zip(team_df["player"], team_df["mins_sim"], fc40):
+                lam_pf = max(0.0, float(r) / 40.0 * float(m))
+                box[p]["PF"] = float(rng.poisson(lam_pf))
+        else:
+            pf_per_min = float(team_df["pf"].sum() / team_df["mins_total"].sum()) if team_df["mins_total"].sum() > 0 else 0.12
+            for p, m in zip(team_df["player"], team_df["mins_sim"]):
+                box[p]["PF"] = float(rng.poisson(max(0.0, pf_per_min * m)))
 
     gw_misses = (sum(v["FGA"] for v in gw_box.values()) - sum(v["FGM"] for v in gw_box.values()))
     op_misses = (sum(v["FGA"] for v in op_box.values()) - sum(v["FGM"] for v in op_box.values()))
@@ -1214,6 +1657,48 @@ with tabs[5]:
             key="opp_shot_pdf",
         )
 
+
+    # -----------------------------------------------------------------------
+    # KenPom per-player advanced/usage tables (paste or upload)
+    # -----------------------------------------------------------------------
+    st.markdown("### KenPom player tables (optional, but recommended)")
+    st.caption("Paste the **expanded player page** table from KenPom (like the screenshot) or upload a CSV export. We'll merge FC/40, FD/40, TORate, Stl%, Blk%, FTRate, etc. into the simulation.")
+
+    kp_col1, kp_col2 = st.columns(2)
+    with kp_col1:
+        gw_kp_raw = st.text_area("GW: Paste raw KenPom advanced/usage table here", value="", height=180, key="gw_kp_player_raw")
+        gw_kp_csv = st.file_uploader("Or upload a GW KenPom advanced CSV", type=["csv"], key="gw_kp_player_csv")
+        gw_kp_df = None
+        try:
+            if gw_kp_csv is not None:
+                gw_kp_df = load_and_clean_kenpom_csv(gw_kp_csv)
+            elif gw_kp_raw.strip():
+                gw_kp_df = parse_kenpom_paste(gw_kp_raw)
+        except Exception as e:
+            st.warning(f"GW KenPom parse issue: {e}")
+            gw_kp_df = None
+
+        if gw_kp_df is not None and not gw_kp_df.empty:
+            st.success(f"Parsed GW KenPom table: {len(gw_kp_df)} players.")
+            st.dataframe(gw_kp_df.head(12), use_container_width=True, hide_index=True)
+
+    with kp_col2:
+        op_kp_raw = st.text_area("Opponent: Paste raw KenPom advanced/usage table here", value="", height=180, key="op_kp_player_raw")
+        op_kp_csv = st.file_uploader("Or upload an Opponent KenPom advanced CSV", type=["csv"], key="op_kp_player_csv")
+        op_kp_df = None
+        try:
+            if op_kp_csv is not None:
+                op_kp_df = load_and_clean_kenpom_csv(op_kp_csv)
+            elif op_kp_raw.strip():
+                op_kp_df = parse_kenpom_paste(op_kp_raw)
+        except Exception as e:
+            st.warning(f"Opponent KenPom parse issue: {e}")
+            op_kp_df = None
+
+        if op_kp_df is not None and not op_kp_df.empty:
+            st.success(f"Parsed Opponent KenPom table: {len(op_kp_df)} players.")
+            st.dataframe(op_kp_df.head(12), use_container_width=True, hide_index=True)
+
     if gw_csv is None or opp_csv is None:
         st.info("Upload both CSVs to enable simulation.")
         st.stop()
@@ -1221,6 +1706,11 @@ with tabs[5]:
     try:
         gw_raw = _read_player_stats_csv(gw_csv)
         op_raw = _read_player_stats_csv(opp_csv)
+        # Merge KenPom per-player tables (if provided)
+        if 'gw_kp_df' in locals() and gw_kp_df is not None:
+            gw_raw = _merge_kenpom_player_table(gw_raw, gw_kp_df)
+        if 'op_kp_df' in locals() and op_kp_df is not None:
+            op_raw = _merge_kenpom_player_table(op_raw, op_kp_df)
     except Exception as e:
         st.error(f"Could not read one of the CSV files: {e}")
         st.stop()
@@ -1257,7 +1747,7 @@ with tabs[5]:
             st.session_state["kp_fill"]["gw"] = _parse_kenpom_team_text(gw_kp_text)
             st.session_state["kp_fill"]["op"] = _parse_kenpom_team_text(op_kp_text)
             st.success("Parsed (if possible). Values will populate below when available.")
-st.markdown("### KenPom team inputs")
+    st.markdown("### KenPom team inputs")
     kp1, kp2, kp3 = st.columns(3)
     with kp1:
         gw_adj_o = st.number_input("GW AdjO", value=float(st.session_state.get("kp_fill",{}).get("gw",{}).get("AdjO",118.2)), step=0.1, format="%.1f")
