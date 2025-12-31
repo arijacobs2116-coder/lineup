@@ -1,11 +1,13 @@
 import itertools
+import math
 import re
 import sqlite3
 from pathlib import Path
 from typing import Dict, Tuple, List
 
-import pandas as pd
 import numpy as np
+
+import pandas as pd
 import streamlit as st
 import bcrypt
 
@@ -759,7 +761,6 @@ def _round_boxscore(avg_box: Dict[str, Dict[str, float]]) -> pd.DataFrame:
         dfr = dfr.sort_values(["MIN", "PTS"], ascending=[False, False]).reset_index(drop=True)
     return dfr
 
-
 ####################
 # Tabs
 ###############################################################################
@@ -934,8 +935,6 @@ with tabs[4]:
         "3P Attempts Against": "ThreePA Ag",
     }
     stat_rank_table(agg_view, "Rank defensive lineups", metric_map, poss_col="DefPoss")
-
-
 
 with tabs[5]:
     st.subheader("Game Simulation (Monte Carlo)")
